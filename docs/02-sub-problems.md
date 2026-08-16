@@ -26,8 +26,9 @@ SP-01 ──> SP-02 ──> SP-04
 
 **Status (final, 2026-08-16):** SP-01, SP-02, SP-04 all solid (Gates A, B, D PASS); SP-03 N/A
 under D1. **Phase 5 / Gate E PASS on CIFAR-10** (2026-08-15/16): exact engine 0.273/0.261/0.250 vs
-tuned STBP baseline 0.270/0.264/0.265 (seeds 0–2), equal SynOps, 160× lower latency; SP-02
-real-data fix (`lam=[5,50]`) removed init dependence. **CIFAR-10-DVS benchmark done (2026-08-16,
+tuned STBP baseline 0.249/0.231/0.252 (seeds 0–2, re-measured 2026-08-16; the earlier per-seed
+"0.270/0.264/0.265" was not reproducible and is superseded), equal SynOps, 160× lower latency;
+SP-02 real-data fix (`lam=[5,50]`) removed init dependence. **CIFAR-10-DVS benchmark done (2026-08-16,
 seeds 0–2): accuracy NOT confirmed** — engine 0.230/0.204/0.220 vs tuned baseline 0.214/0.250/0.234
 (mean 0.218 vs 0.233), mixed within seed noise, baseline marginally ahead; 160× latency win stands
 (`docs/results/SP-05-DVS-experiments.md`). Strictly-worded PRD G0 "and CIFAR-10-DVS" accuracy bar:

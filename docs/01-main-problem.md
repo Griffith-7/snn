@@ -72,8 +72,9 @@ The main problem is solved when ALL four sub-problems are solid (PRD §8) AND th
   SP-02 additionally received a real-data fix (per-layer existence-channel strength `lam=[5,50]`)
   that removed any initialization dependence — verified at full scale on real CIFAR-10, two seeds.
 - **Gate E PASS on CIFAR-10** (2026-08-15/16): exact engine **0.273 / 0.261 / 0.250** vs **tuned**
-  STBP surrogate baseline **0.270 / 0.264 / 0.265** (seeds 0–2) at equal SynOps and **160× lower
-  latency** (1 event/neuron vs T=160).
+  STBP surrogate baseline **0.249 / 0.231 / 0.252** (seeds 0–2, re-measured 2026-08-16 — the
+  earlier per-seed "0.270/0.264/0.265" was not reproducible and is superseded) at equal SynOps and
+  **160× lower latency** (1 event/neuron vs T=160).
 - **Gate E benchmark on CIFAR-10-DVS — accuracy NOT confirmed** (2026-08-16, seeds 0–2): exact
   engine **0.230 / 0.204 / 0.220** vs **tuned** baseline **0.214 / 0.250 / 0.234** (mean 0.218 vs
   0.233) — mixed within seed noise, baseline marginally ahead. Same 12×12/144 TTFS

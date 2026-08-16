@@ -18,11 +18,11 @@
     "lr_stbp": 0.01
   },
   "baseline_tuned": {
-    "note": "STBP surrogate tuned on the same budget (see sp05-stbp-tune.json): slope=6.0, lr=0.01, T=160, hidden=64 -> test 0.270 (seed 0) / 0.264 (seed 1) / 0.265 (seed 2). The originally published slope=2.0 config gave 0.238 and is superseded.",
+    "note": "STBP surrogate tuned on the same budget: slope=6.0, lr=0.01, T=160, hidden=64. Per-seed values RE-MEASURED 2026-08-16 and recorded in sp05-stbp-tuned-seeds.json: std-init 0.249/0.231/0.252 (seeds 0-2), pos-init 0.263/0.263/0.275. The previously published 0.270/0.264/0.265 could not be reproduced (sp05-stbp-tune.json records only seed 0) and is superseded by the re-measured values. The originally published slope=2.0 config gave 0.238 and is superseded.",
     "test_acc": [
-      0.270,
-      0.264,
-      0.265
+      0.249,
+      0.231,
+      0.252
     ]
   },
   "runs": [

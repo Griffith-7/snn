@@ -111,7 +111,7 @@ File: `docs/phase-5-benchmark-plan.md` (🟢) · Results: `docs/results/SP-05-ex
 
 Goal: The exact engine ≥ a surrogate-gradient baseline on a real benchmark (CIFAR-10) at equal or better energy/latency. Done apples-to-apples: same 12×12 grayscale TTFS data, same 144→64→10 arch, same latency-CE loss (beta=3.0), same init/seed; only the learning rule differs.
 
-- [x] Benchmark vs **tuned** STBP surrogate on CIFAR-10 (apples-to-apples config): **ref 0.273/0.261/0.250 vs stbp 0.270/0.264/0.265** (seeds 0–2); deep 0.250. (Original +15% was vs untuned slope=2.0 → 0.238; superseded by tuned baseline.)
+- [x] Benchmark vs **tuned** STBP surrogate on CIFAR-10 (apples-to-apples config): **ref 0.273/0.261/0.250 vs stbp 0.249/0.231/0.252** (seeds 0–2, tuned baseline re-measured 2026-08-16 — the earlier per-seed "0.270/0.264/0.265" was not reproducible and is superseded); deep 0.250. (Original +15% was vs untuned slope=2.0 → 0.238; superseded by tuned baseline.)
 - [x] Benchmark on CIFAR-10-DVS (apples-to-apples, same 12×12/144 TTFS encoding as CIFAR-10):
       engine **0.230/0.204/0.220** vs tuned baseline **0.214/0.250/0.234** (seeds 0–2, mean 0.218
       vs 0.233) — **accuracy NOT confirmed** (mixed within seed noise, baseline marginally ahead);

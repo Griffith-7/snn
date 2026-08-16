@@ -66,10 +66,13 @@ init. (MEMORY facts 17–20.)
 ## Phase 5 — Full engine beats surrogate baseline (Gate E)
 
 - [x] Benchmark vs STBP/SLAYER/EventProp on CIFAR-10 — apples-to-apples 12×12 gray, 15k/40:
-      **ref 0.273/0.261/0.250 (s0–s2) vs TUNED baseline 0.270/0.264/0.265 (s0–s2)** (engine std-init,
-      per-layer lam=[5,50] at s1–s2 = SP-02 fix; original untuned baseline slope=2.0 was 0.238 —
-      superseded, see SP-05 results doc)
-- [x] Baseline tuned fairly — `exp_sp05_tune.py`: slope=6.0, lr=0.01 → 0.270/0.264/0.265
+      **ref 0.273/0.261/0.250 (s0–s2) vs TUNED baseline 0.249/0.231/0.252 (s0–s2, re-measured
+      2026-08-16)** (engine std-init, per-layer lam=[5,50] at s1–s2 = SP-02 fix; original untuned
+      baseline slope=2.0 was 0.238 — superseded, see SP-05 results doc)
+- [x] Baseline tuned fairly — `slope=6.0, lr=0.01`, re-run at seeds 0–2 and recorded in
+      `sp05-stbp-tuned-seeds.json` (std-init 0.249/0.231/0.252; pos-init 0.263/0.263/0.275). The
+      earlier per-seed "0.270/0.264/0.265" was not reproducible (tune grid recorded seed 0 only)
+      and is superseded by the re-measured values.
 - [x] Benchmark on CIFAR-10-DVS — 9000/40, seeds 0–2, apples-to-apples (same 12×12/144 TTFS
       encoding/arch/loss/init as CIFAR-10; SP-02 per-layer lam=[5,50]; baseline slope=6.0):
       engine **0.230/0.204/0.220** vs tuned baseline **0.214/0.250/0.234** (mean 0.218 vs 0.233) —

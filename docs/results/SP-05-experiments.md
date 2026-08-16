@@ -34,8 +34,13 @@ Same data pipeline, architecture family, loss family, and optimizer family for e
 
 The originally published baseline (`slope=2.0, lr=0.01, T=160`, hidden=64) reached **0.238**.
 Tuning the surrogate on the *same* budget (`exp_sp05_tune.py`) shows it was under-configured:
-`slope=6.0, lr=0.01` reaches **0.270 / 0.264 / 0.265** at seeds 0–2 (seed-robust). The honest
-head-to-head below uses this tuned baseline; `slope=2.0` numbers are kept for transparency.
+`slope=6.0, lr=0.01`. **The per-seed tuned baseline was re-measured 2026-08-16 and recorded in
+`docs/results/sp05/sp05-stbp-tuned-seeds.json`: std-init 0.249 / 0.231 / 0.252, pos-init
+0.263 / 0.263 / 0.275 (seeds 0–2).** The earlier published "0.270 / 0.264 / 0.265" could not be
+reproduced from any recorded run (the committed `exp_sp05_tune.py` records only seed 0) and is
+**superseded**. The honest head-to-head below uses the std-init tuned baseline — matching the
+engine's std-init numbers so only the learning rule differs. The `slope=2.0` numbers are kept for
+transparency.
 
 ## Main result — 15k train, 40 epochs
 
@@ -46,10 +51,10 @@ head-to-head below uses this tuned baseline; `slope=2.0` numbers are kept for tr
 | **ref (exact engine)** | **0.273 / 0.261 / 0.250** | s0 std-init lam=5 (healthy seed); s1–s2 std-init per-layer lam=[5,50] (SP-02 fix, no pos-init) | 13,573 | **1 event/neuron** | ~116 min |
 | ref (engine, pos-init robust config) | — / 0.269 / — | positive-uniform init, lam=5 | 13,573 | 1 event/neuron | ~116 min |
 | deep (SP-04 local) | 0.250 / — / — | — | 13,573 | 1 event/neuron | 83.8 min |
-| stbp (surrogate baseline, tuned slope=6.0) | **0.270 / 0.264 / 0.265** | std-init, T=160 | ~11.5–12.4 k | T=160 timesteps | ~5 min |
+| stbp (surrogate baseline, tuned slope=6.0, re-measured) | **0.249 / 0.231 / 0.252** | std-init, T=160 | ~11.5–12.4 k | T=160 timesteps | ~5 min |
 
-- **Verdict: engine ≥ tuned baseline at seed 0 (0.273 vs 0.270); engine ≈ baseline within seed
-  noise at seeds 1–2 (0.261/0.250 vs 0.264/0.265).** The accuracy margin is thin (within seed
+- **Verdict: engine ≥ tuned baseline at seeds 0–1 (0.273/0.261 vs 0.249/0.231); engine ≈ baseline
+  within seed noise at seed 2 (0.250 vs 0.252).** The accuracy margin is thin (within seed
   noise), and the **decisive, reproducible win is latency**: **1 spike per neuron** (TTFS) vs the
   baseline's **160 discrete timesteps**, at comparable SynOps/test. The originally published
   +15% was vs the untuned baseline (slope=2.0 → 0.238) and is superseded by the tuned comparison.
@@ -69,13 +74,13 @@ mode ref:
 | lam=5 (uniform, old default) | 0.104 (s1) | 0.996 | output layer collapsed |
 | lam=20 (uniform) | 0.225 (s1) | 0.101 | no collapse, underfits |
 | **lam=[5,50] (per-layer)** | **0.261 / 0.250** (s2 peak 0.284) | **0.0000 / 0.0000** | **robust, no pos-init, real data** |
-| tuned baseline (std-init) | 0.264 / 0.265 | — | reference |
+| tuned baseline (std-init, re-measured) | 0.231 / 0.252 | — | reference |
 
 - The collapse is **fixed without any firing-guaranteeing init**, on real CIFAR-10 (no toys),
-  across two full seeds (0% silent out, 0% silent hid); accuracy is statistically tied with the
-  tuned baseline (~0.3 pp under seed-1, ~1.5 pp under seed-2) but still ~0.8 pp under the best
-  engine config (pos-init). Remaining gap is an accuracy/readout matter, not a collapse matter
-  (Q5 resolved, MEMORY facts 19–20).
+  across two full seeds (0% silent out, 0% silent hid); with the re-measured tuned baseline the
+  engine is **ahead at seed 1 (0.261 vs 0.231)** and **tied at seed 2 (0.250 vs 0.252)**, and the
+  best engine config (pos-init, 0.269 at s1) remains above both. Remaining gap is an
+  accuracy/readout matter, not a collapse matter (Q5 resolved, MEMORY facts 19–20).
 
 ## Debugging trail (what was wrong, and the fixes)
 
@@ -140,7 +145,7 @@ SP-02 robustness fix. Baseline tuned: `slope=6.0`. Seeds 0–2 published where r
 
 | Requirement (Gate E) | Result |
 |---|---|
-| Benchmark vs STBP/SLAYER on CIFAR-10 (apples-to-apples) | done — ref 0.273/0.261/0.250 (s0–s2) vs **tuned** baseline 0.270/0.264/0.265; same data/arch/loss/std-init |
+| Benchmark vs STBP/SLAYER on CIFAR-10 (apples-to-apples) | done — ref 0.273/0.261/0.250 (s0–s2) vs **tuned** baseline 0.249/0.231/0.252 (re-measured); same data/arch/loss/std-init |
 | Energy (SynOps) + latency (timesteps) measured | done — SynOps ~13.6 k vs ~11.5–12.4 k; latency **1 event/neuron** vs **T=160** |
 | Configs + seeds published; single-file rerun | done — full config above; `exp_sp05.py --mode all` |
 | Robustness (no init dependence) | done — SP-02 per-layer lam [5,50]: full-scale 0.261/0.250, 0% silent, std-init, 2 seeds (real data, no toys) |

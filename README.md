@@ -24,7 +24,12 @@ Reproduction: `python engine/experiments/exp_sp05.py --mode all` (15k/40, seeds 
 
 | Benchmark | Exact engine | Tuned STBP surrogate | Note |
 |---|---|---|---|
-| CIFAR-10 | **0.273 / 0.261 / 0.250** | 0.270 / 0.264 / 0.265 | ≈equal accuracy, **160× lower latency** (1 event/neuron vs T=160) |
+| CIFAR-10 | **0.273 / 0.261 / 0.250** | 0.249 / 0.231 / 0.252* | ≈equal-or-better accuracy, **160× lower latency** (1 event/neuron vs T=160) |
+
+\* Tuned STBP baseline (slope=6.0), **re-measured** at seeds 0–2 on 2026-08-16
+(`docs/results/sp05/sp05-stbp-tuned-seeds.json`); a pos-init variant re-measures to 0.263/0.263/0.275.
+An earlier per-seed claim of 0.270/0.264/0.265 was not reproducible from any recorded run and has
+been superseded — engine is ≥ the re-measured tuned baseline at seeds 0–1, tied at seed 2.
 | CIFAR-10-DVS | 0.230 / 0.204 / 0.220 | 0.214 / 0.250 / 0.234 | **Accuracy NOT confirmed** (mixed within seed noise); latency win decisive |
 
 Honesty rule: failures and non-confirmations are reported as prominently as wins. The DVS accuracy

@@ -2,6 +2,23 @@
 
 Dated, chronological record of work. Append new entries at the bottom.
 
+## 2026-08-16 — CORRECTION: tuned-baseline per-seed numbers RE-MEASURED (were unreproducible)
+
+Audit found the published tuned baseline **"0.270/0.264/0.265 (seeds 0–2)"** had no backing
+recorded run: the committed `exp_sp05_tune.py` hardcodes `seed=0` (and defaults to pos-init), and
+`sp05-stbp-tune.json` contains only seed-0 runs (0.2682 / 0.2735 at the claimed config, plus T and
+hidden variants). Re-ran the tuned baseline (`slope=6.0, lr_stbp=0.01, T_stbp=160, hidden=64`,
+seeds 0–2, same machine RTX 3050 / torch 2.13 / numpy 2.4.4, ~4.7 min/run) and recorded full
+per-epoch histories in **`docs/results/sp05/sp05-stbp-tuned-seeds.json`**:
+- **std-init: 0.249 / 0.231 / 0.252** (the apples-to-apples comparison — matches the engine's
+  std-init numbers; engine ≥ baseline at seeds 0–1, tied at seed 2)
+- **pos-init: 0.263 / 0.263 / 0.275** (what the committed tune script produces by default)
+
+The old claim is kept on record as **superseded**. Updated: README.md, FINAL-REPORT.md,
+`docs/tracking/GATES.md`, PLAN.md, `docs/01-main-problem.md`, `docs/02-sub-problems.md`,
+`docs/results/SP-05-experiments.md`, `docs/results/sp05/sp05-results.json`
+(`baseline_tuned` note + values), MEMORY facts 16/18/20/23 + Q5.
+
 ## 2026-08-16 — PROJECT ACCEPTED AS COMPLETE
 
 User decision: **accept and finalize** (over: more epochs on CIFAR-10 / DVS, or a training-speed

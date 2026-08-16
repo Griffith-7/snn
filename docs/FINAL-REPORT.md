@@ -24,9 +24,9 @@ numerical precision and then on a real benchmark:
 - Spike birth/death handled by escape-noise *expectation* (not a tuned sigmoid), revived far-dead
   neurons on toy problems and — after a real-data fix — a fully collapsed 10-class output layer.
 - Exact, local, O(1)-memory credit assignment (SP-04).
-- On CIFAR-10 (15k train, 40 epochs), the exact engine **matches a tuned STBP surrogate baseline
-  (0.273/0.261/0.250 vs 0.270/0.264/0.265)** with **160× lower latency** (1 event/neuron vs T=160
-  timesteps) at comparable compute (SynOps).
+- On CIFAR-10 (15k train, 40 epochs), the exact engine **meets or beats a tuned STBP surrogate
+  baseline (0.273/0.261/0.250 vs re-measured 0.249/0.231/0.252)** with **160× lower latency**
+  (1 event/neuron vs T=160 timesteps) at comparable compute (SynOps).
 - On CIFAR-10-DVS (9k train, 40 epochs, same 12×12/144 TTFS encoding), the engine is **≈ the tuned
   surrogate on accuracy** (0.230/0.204/0.220 vs 0.214/0.250/0.234 across seeds 0–2 — mixed within
   seed noise) with the same 160× latency win at ~equal SynOps; this is reported honestly as not
@@ -165,8 +165,13 @@ learning rule differs**:
 - **Modes:** `ref` = exact SP-01 + SP-02 with W^T transport (the engine); `deep` = SP-04 local loss
   (no W^T); `stbp` = from-scratch STBP surrogate baseline (`engine/baseline_stbp.py`).
 - **Baseline tuned fairly:** the originally published `slope=2.0` baseline (0.238) was
-  under-configured; tuning to `slope=6.0` gives 0.270/0.264/0.265. The honest head-to-head uses the
-  tuned baseline.
+  under-configured; tuning to `slope=6.0` (seeds 0–2, **re-measured 2026-08-16**) gives
+  **0.249 / 0.231 / 0.252** std-init (`docs/results/sp05/sp05-stbp-tuned-seeds.json`). The committed
+  `exp_sp05_tune.py` runs pos-init by default; the pos-init tuned baseline re-measures to
+  0.263 / 0.263 / 0.275 (recorded in the same file). The previously published "0.270/0.264/0.265"
+  per-seed baseline could not be reproduced from any recorded run (the tune grid recorded only
+  seed 0) and is **superseded by the re-measured values**. The honest head-to-head uses the
+  std-init tuned baseline, matching the engine's std-init numbers (only the learning rule differs).
 - **Budget:** 15,000 train / 10,000 test, 40 epochs, B=128.
 
 ### Official Gate E table
@@ -176,13 +181,13 @@ learning rule differs**:
 | **ref (exact engine)** | **0.273 / 0.261 / 0.250** | s0 std-init lam=5; s1–s2 std-init per-layer lam=[5,50] | 13,573 | **1 event/neuron** | ~116 min |
 | ref (pos-init robust config) | — / 0.269 / — | positive-uniform init, lam=5 | 13,573 | 1 event/neuron | ~116 min |
 | deep (SP-04, local) | 0.250 / — / — | no W^T transport | 13,573 | 1 event/neuron | ~84 min |
-| stbp (surrogate, tuned) | **0.270 / 0.264 / 0.265** | std-init, T=160 | ~11.5–12.4 k | T=160 timesteps | ~5 min |
+| stbp (surrogate, tuned, re-measured) | **0.249 / 0.231 / 0.252** | std-init, T=160 | ~11.5–12.4 k | T=160 timesteps | ~5 min |
 
-**Verdict (honest):** the engine **≥** the tuned surrogate at seed 0 (0.273 vs 0.270) and is
-**statistically tied within seed noise** at seeds 1–2 (0.261/0.250 vs 0.264/0.265) — at equal
-SynOps and **160× lower latency**. The decisive, reproducible win is **latency**: 1 spike per neuron
-(TTFS) vs the baseline's 160 discrete timesteps. The engine is ~54× slower per batch in wall-clock
-(exact IFT scan + adjoint), reported for transparency.
+**Verdict (honest):** the engine **≥** the tuned surrogate at seeds 0–1
+(0.273/0.261 vs 0.249/0.231) and is **statistically tied within seed noise** at seed 2
+(0.250 vs 0.252) — at equal SynOps and **160× lower latency**. The decisive, reproducible win is
+**latency**: 1 spike per neuron (TTFS) vs the baseline's 160 discrete timesteps. The engine is
+~54× slower per batch in wall-clock (exact IFT scan + adjoint), reported for transparency.
 
 Gate E PASS. The main problem (PRD G0) is solved on CIFAR-10 (the CIFAR-10-DVS subsection below
 did not confirm the accuracy bar).
