@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# Datasets (large, re-downloadable; small caches kept under data/ are tracked)
+cifar-10-python/
+data/cifar10dvs/train_file
+data/cifar10dvs/test_file
+
+# Logs (evidence logs under docs/results/evidence are tracked intentionally)
+*.log
+!docs/results/evidence/*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
