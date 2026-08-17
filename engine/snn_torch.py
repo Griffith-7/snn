@@ -211,19 +211,35 @@ def backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up, tm, ts, alpha,
 
 def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
                               alpha, k_peak, t_max, theta=1.0):
-    """SP-03 saltation-based backward for one layer.
+    """SP-03 saltation backward — GPU-vectorized fast path.
 
-    Weight gradients via `ResetLIF.sensitivity_all()` (exact through ALL resets
-    using the saltation matrix).  Input-time gradients via the TTFS IFT formula
-    (same as backward_layer_torch).
+    For the first spike (no intermediate resets before t_post), the IFT
+    formula is exact because the no-reset and reset trajectories are
+    identical until the first crossing.  The grid forward always returns
+    the first crossing, so this fast path covers the entire current
+    training pipeline at the same speed as backward_layer_torch.
 
-    Same signature as backward_layer_torch + t_max + theta.  Returns (grad, lam_prev).
+    For multi-spike regimes (future reset-LIF forward), use
+    _backward_saltation_full() which runs the full ResetLIF sensitivity.
+    """
+    return backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up,
+                                tm, ts, alpha, k_peak)
+
+
+def _backward_saltation_full(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
+                             k_peak, t_max, theta):
+    """Full SP-03 saltation backward — for multi-spike regimes.
+
+    Uses ResetLIF.sensitivity_first_spike (vectorized numpy, early exit)
+    for weight gradients, and the IFT formula for input-time gradients.
+    Falls back to CPU for the per-neuron-per-sample loop.
     """
     n_cur, n_inp = W.shape
     n_in = n_inp - 1
     B = t_post.shape[1]
     dev = W.device
     dtype = W.dtype
+
     grad = torch.zeros_like(W)
     lam_prev = torch.zeros((n_in, B), dtype=dtype, device=dev)
 
@@ -231,11 +247,6 @@ def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
     if not fired.any():
         return grad, lam_prev
 
-    # ResetLIF membrane: u(dt) = w * (exp(-dt/ts) - exp(-dt/tm)) / (1 - tm/ts)
-    #                       = w * ts * K_raw(dt)
-    # Grid engine:        u_grid(dt) = w * K_raw(dt) / k_peak
-    # So u_ResetLIF = ts * k_peak * u_grid, and the firing threshold
-    # must be theta * ts * k_peak to match the grid forward's u_grid >= theta.
     lif = ResetLIF(tm=tm, ts=ts, theta=theta * ts * k_peak)
 
     W_np = W.detach().cpu().numpy().astype(np.float64)
@@ -245,15 +256,13 @@ def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
     lam_np = lam_post.detach().cpu().numpy().astype(np.float64)
 
     grad_np = np.zeros_like(W_np)
-    lam_prev_np = np.zeros((n_in, B), dtype=np.float64)
 
     for j in range(n_cur):
         for b in range(B):
             lam_jb = lam_np[j, b]
             if lam_jb == 0.0 or not np.isfinite(t_post_np[j, b]):
                 continue
-            up_jb = up_np[j, b]
-            if abs(up_jb) < 1e-12:
+            if abs(up_np[j, b]) < 1e-12:
                 continue
 
             inputs = []
@@ -262,32 +271,24 @@ def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
                 inputs.append((t_val, float(W_np[j, i])))
             inputs.append((0.0, float(W_np[j, n_in])))
 
-            fires, dtdw_matrix = lif.sensitivity_all(inputs, t_end=t_max)
-            if not fires:
+            fire_t, dtdw = lif.sensitivity_first_spike(inputs, t_end=t_max)
+            if fire_t is None:
                 continue
+            grad_np[j, :] += lam_jb * dtdw
 
-            dt_first_dW = np.array(dtdw_matrix[0])
-            grad_np[j, :] += lam_jb * dt_first_dW
-
+    lam_prev_np = np.zeros((n_in, B), dtype=np.float64)
     for j in range(n_cur):
-        for b in range(B):
-            if lam_np[j, b] == 0.0 or not np.isfinite(t_post_np[j, b]):
-                continue
-            up_jb = up_np[j, b]
-            if abs(up_jb) < 1e-12:
-                continue
-            for i in range(n_in):
-                if not np.isfinite(t_prev_np[i, b]):
-                    continue
-                d = float(t_post_np[j, b] - t_prev_np[i, b])
-                if d <= 0:
-                    continue
-                if alpha:
-                    kd = (1.0 - d / tm) * math.exp(1.0 - d / tm) / (tm * k_peak)
-                else:
-                    kd = (-math.exp(-d / tm) / tm + math.exp(-d / ts) / ts) / (tm - ts) / k_peak
-                dt_dtin = W_np[j, i] * kd / up_jb
-                lam_prev_np[i, b] += lam_np[j, b] * dt_dtin
+        m_j = lam_np[j] != 0.0
+        m_j &= np.isfinite(t_post_np[j])
+        m_j &= np.abs(up_np[j]) > 1e-12
+        if not m_j.any():
+            continue
+        td = t_post_np[j:j+1, :] - t_prev_np
+        valid = m_j[np.newaxis, :] & np.isfinite(t_prev_np) & (td > 0)
+        d = np.where(valid, td, 0.0)
+        kd = (-np.exp(-d / tm) / tm + np.exp(-d / ts) / ts) / (tm - ts) / k_peak
+        dt_dtin = W_np[j:j+1, :n_in] * kd / up_np[j:j+1, :]
+        lam_prev_np += (lam_np[j:j+1, :] * dt_dtin * valid)
 
     grad = torch.tensor(grad_np, dtype=dtype, device=dev)
     lam_prev = torch.tensor(lam_prev_np, dtype=dtype, device=dev)
@@ -524,6 +525,11 @@ class TTFSNetTorch:
                                  self.grid, self.tm, self.ts, self._alpha,
                                  self.k_peak)
 
+    def _edge_peak_guard(self, W, t_prev, t_peak, u_peak):
+        """Degenerate-plateau guard. Overridden by the event-driven engine."""
+        return edge_peak_guard(W, t_prev, self.t_bias, t_peak, u_peak,
+                               self.grid)
+
     def forward(self, t_in):
         t = t_in
         cache = []
@@ -622,8 +628,7 @@ class TTFSNetTorch:
             else:
                 target = (~fired) * (hidden_target != 0.0)
             target = target.to(dtype)
-            guard = edge_peak_guard(W, t_prev, self.t_bias, t_peak, u_peak,
-                                    self.grid)
+            guard = self._edge_peak_guard(W, t_prev, t_peak, u_peak)
             target = target * (~guard).to(dtype)
             if exclude is not None:
                 target = target * (~exclude[l]).to(dtype)
@@ -762,8 +767,7 @@ class TTFSNetTorch:
             else:
                 target = (~fired) * (hidden_target != 0.0)
             target = target.to(dtype)
-            guard = edge_peak_guard(W, t_prev, self.t_bias, t_peak, u_peak,
-                                    self.grid)
+            guard = self._edge_peak_guard(W, t_prev, t_peak, u_peak)
             target = target * (~guard).to(dtype)
             if exclude is not None:
                 target = target * (~exclude[l]).to(dtype)

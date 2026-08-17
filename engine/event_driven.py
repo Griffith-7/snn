@@ -262,6 +262,41 @@ def peak_margin_event(W, t_prev, t_bias, theta, t_max, tm, ts, k_peak):
     return t_peak, u_peak
 
 
+def edge_peak_guard_event(W, t_prev, t_bias, t_peak, u_peak, t_max,
+                          w_cut=1e-9, u_cut=1e-6, n_inferred=4001):
+    """Grid-free degenerate-plateau guard for the event-driven engine.
+
+    Same logic as edge_peak_guard but takes a step-size estimate
+    (t_max / n_inferred) instead of requiring the actual grid tensor.
+    Flags neurons where the peak sits at the window start with near-zero
+    potential (degenerate plateau → zero existence gradient).
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    B = t_prev.shape[1]
+    dev = W.device
+    dtype = W.dtype
+    inf = float("inf")
+    ev_times = torch.full((n_cur, B, n_in + 1), inf, dtype=dtype, device=dev)
+    if n_in:
+        ev_times[:, :, :n_in] = t_prev.t().unsqueeze(0)
+    ev_times[:, :, n_in] = t_bias
+    ev_w = torch.cat([W[:, :n_in], W[:, n_in].view(-1, 1)], dim=1).abs()
+    contrib = ev_w > 1e-12
+    masked = torch.where(contrib.unsqueeze(1), ev_times,
+                         torch.full_like(ev_times, inf))
+    t_start = masked.min(dim=2).values
+    t_start = torch.where(torch.isfinite(t_start), t_start,
+                          torch.zeros_like(t_start))
+    earliest_idx = masked.argmin(dim=2)
+    earliest_w = ev_w.gather(1, earliest_idx)
+    step = t_max / n_inferred
+    at_start = t_peak <= t_start + 1.5 * step
+    flat = (u_peak.abs() < u_cut) & at_start
+    flippable = (earliest_w <= w_cut) & at_start
+    return flat | flippable
+
+
 class EventTTFSNet(TTFSNetTorch):
     """Event-driven exact engine. Drop-in for TTFSNetTorch (same weights, same
     seeds, same interface); alpha kernels fall back to the grid engine."""
@@ -277,3 +312,9 @@ class EventTTFSNet(TTFSNetTorch):
             return super()._peak_margin(W, t_prev)
         return peak_margin_event(W, t_prev, self.t_bias, self.theta,
                                  self.t_max, self.tm, self.ts, self.k_peak)
+
+    def _edge_peak_guard(self, W, t_prev, t_peak, u_peak):
+        if self._alpha:
+            return super()._edge_peak_guard(W, t_prev, t_peak, u_peak)
+        return edge_peak_guard_event(W, t_prev, self.t_bias, t_peak, u_peak,
+                                     self.t_max)

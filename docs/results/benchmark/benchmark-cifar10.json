@@ -1,0 +1,39 @@
+{
+  "config": {
+    "epochs": 10,
+    "n_train": 5000,
+    "res": 12,
+    "sizes": [
+      144,
+      64,
+      10
+    ],
+    "grid_pts": 1001,
+    "B": 128,
+    "lr": 0.02,
+    "w_scale": 0.4,
+    "bias_val": 0.2,
+    "T_stbp": 160,
+    "lr_stbp": 0.01,
+    "slope": 2.0,
+    "beta": 3.0,
+    "seed": 0
+  },
+  "dataset": "cifar10",
+  "runs": [
+    {
+      "label": "exact",
+      "test_acc": 0.1905,
+      "train_s": 455.6721646785736,
+      "fwd_ms": 413.0819797515869,
+      "bwd_ms": 121.48451805114746
+    },
+    {
+      "label": "event",
+      "test_acc": 0.1943,
+      "train_s": 115.91012144088745,
+      "fwd_ms": 115.86828231811523,
+      "bwd_ms": 121.46711349487305
+    }
+  ]
+}

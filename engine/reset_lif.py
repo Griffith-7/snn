@@ -281,6 +281,55 @@ class ResetLIF:
             t = tk
         return fires, dtdw_matrix
 
+    # ---- first-spike only (vectorised, early exit) ----------------------
+    def sensitivity_first_spike(self, inputs, t_end=200.0):
+        """d(first_spike)/d(w_m) for ALL weights — numpy-vectorized, early exit.
+
+        Returns (fire_time, dtdw_array) or (None, zeros) if no spike.
+        ~n_w x faster than sensitivity_all because the inner weight loop
+        uses numpy array ops instead of Python list loops, and processing
+        stops at the first spike (no unnecessary event traversal).
+        """
+        n_w = len(inputs)
+        evs = sorted((float(t), float(w), m) for m, (t, w) in enumerate(inputs))
+
+        u, ci = self.u_rest, 0.0
+        s_u = _np.zeros(n_w, dtype=_np.float64)
+        s_i = _np.zeros(n_w, dtype=_np.float64)
+        t = 0.0
+        a, br = 1.0 / self.tm, 1.0 / self.ts
+        fac = 1.0 / (1.0 - self.tm / self.ts)
+
+        for tk, wk, m in evs + [(t_end, 0.0, -1)]:
+            if tk <= t:
+                ci += wk
+                s_i[m] += 1.0
+                continue
+            while t < tk - 1e-12:
+                res = self._find_first_crossing(u, ci, t, tk)
+                if res is None:
+                    break
+                tf, i_f = res
+                dt_f = tf - t
+                ea = math.exp(-a * dt_f)
+                eb = math.exp(-br * dt_f)
+                cp = (eb - ea) * fac
+                s_uf = s_u * ea + s_i * cp
+                up_f = (i_f - self.theta) / self.tm
+                if abs(up_f) > 1e-10:
+                    return tf, -s_uf / up_f
+                return tf, _np.full(n_w, math.copysign(math.inf, -float(s_uf[0])))
+            dt_e = tk - t
+            ea = math.exp(-a * dt_e)
+            eb = math.exp(-br * dt_e)
+            cp = (eb - ea) * fac
+            u, s_u = u * ea + ci * cp, s_u * ea + s_i * cp
+            ci, s_i = ci * eb, s_i * eb
+            ci += wk
+            s_i[m] += 1.0
+            t = tk
+        return None, _np.zeros(n_w, dtype=_np.float64)
+
     # ---- fixed-time state + sensitivity ---------------------------------
     def state_at(self, inputs, t_eval, w_idx=0, use_saltation=True, t_end=200.0):
         """(u, i, s_u, s_i) at a fixed time t_eval (no crossing at t_eval),
