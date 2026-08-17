@@ -20,7 +20,7 @@ import math
 import numpy as np
 import torch
 
-from losses_torch import latency_cross_entropy
+from losses_torch import latency_cross_entropy, spike_count_cross_entropy, rate_latency_loss
 from reset_lif import ResetLIF
 
 
@@ -356,6 +356,224 @@ def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
     return grad, lam_prev
 
 
+def _u_at_ms(W, t_prev, tm, ts, k_peak, t, t_f_prev, i_f_prev, unconsumed):
+    """Membrane after reset at (t_f_prev, i_f_prev) evaluated at times t.
+
+    t, t_f_prev, i_f_prev: (n_cur, B).  unconsumed: (n_cur, B, n_in).
+    Returns (n_cur, B).
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    free = i_f_prev * ts * k_peak * _K(t - t_f_prev, tm, ts, False, k_peak)
+    forced = torch.zeros_like(t)
+    if n_in:
+        D = t.unsqueeze(-1) - t_prev.t().unsqueeze(0)
+        K_val = _K(D, tm, ts, False, k_peak)
+        forced = (W[:, :n_in].unsqueeze(1) * K_val * unconsumed.float()).sum(dim=2)
+    return free + forced
+
+
+def _du_at_ms(W, t_prev, tm, ts, k_peak, t, t_f_prev, i_f_prev, unconsumed):
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    free = i_f_prev * ts * k_peak * _Kd(t - t_f_prev, tm, ts, False, k_peak)
+    forced = torch.zeros_like(t)
+    if n_in:
+        D = t.unsqueeze(-1) - t_prev.t().unsqueeze(0)
+        Kd_val = _Kd(D, tm, ts, False, k_peak)
+        forced = (W[:, :n_in].unsqueeze(1) * Kd_val * unconsumed.float()).sum(dim=2)
+    return free + forced
+
+
+def forward_multispike_layer_torch(W, t_prev, t_bias, tm, ts, theta, k_peak,
+                                    t_max, grid, max_spikes=20,
+                                    n_bisect=15, n_newton=8):
+    """GPU-vectorized multi-spike forward via grid iteration.
+
+    After each spike the membrane is decomposed as
+        u(t) = free_response(t - t_f, i_f) + forced_response(t, t_f)
+    where forced_response sums over unconsumed (post-spike) inputs.
+    All operations are tensor-based with no Python loops over (neuron, sample).
+
+    Returns (t_post, up, t_all, up_all) same shape as forward_multispike_layer.
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    B = t_prev.shape[1]
+    G = grid.numel()
+    dev = W.device
+    dtype = W.dtype
+    b_inv = 1.0 / ts
+
+    g = grid.view(1, 1, -1)
+    U_base = torch.zeros((n_cur, B, G), dtype=dtype, device=dev)
+    for i in range(n_in):
+        d = g - t_prev[i].view(1, -1, 1)
+        U_base += W[:, i].view(n_cur, 1, 1) * _K(d, tm, ts, False, k_peak)
+    U_base += W[:, n_in].view(n_cur, 1, 1) * _K(g - t_bias, tm, ts, False, k_peak)
+
+    if n_in:
+        K_grid = _K(g - t_prev.unsqueeze(-1), tm, ts, False, k_peak)
+    else:
+        K_grid = None
+
+    t_post = torch.full((n_cur, B), float("inf"), dtype=dtype, device=dev)
+    up = torch.zeros((n_cur, B), dtype=dtype, device=dev)
+    t_all = torch.full((n_cur, B, max_spikes), float("inf"), dtype=dtype, device=dev)
+    up_all = torch.zeros((n_cur, B, max_spikes), dtype=dtype, device=dev)
+
+    active = torch.ones((n_cur, B), dtype=torch.bool, device=dev)
+    t_f_prev = torch.zeros((n_cur, B), dtype=dtype, device=dev)
+    i_f_prev = torch.zeros((n_cur, B), dtype=dtype, device=dev)
+    unconsumed = torch.ones((n_cur, B, n_in), dtype=torch.bool, device=dev) if n_in else None
+    U = U_base.clone()
+
+    for k in range(max_spikes):
+        if not active.any():
+            break
+
+        U_scan = torch.where(active.unsqueeze(-1), U, torch.full_like(U, float("inf")))
+        mask = U_scan >= theta
+        any_mask = mask.any(dim=2)
+        if not any_mask.any():
+            break
+
+        idx = mask.long().argmax(dim=2)
+        idxc = idx.clamp(min=1)
+        a_br = grid[(idxc - 1).clamp(min=0)]
+        b_br = grid[idxc.clamp(max=G - 1)]
+        fa = U.gather(2, (idxc - 1).clamp(min=0).unsqueeze(-1)).squeeze(-1) - theta
+        fb = U.gather(2, idxc.unsqueeze(-1)).squeeze(-1) - theta
+        at_first = (idx == 0) & any_mask
+
+        for _ in range(n_bisect):
+            m = 0.5 * (a_br + b_br)
+            if k == 0:
+                fm = _u_at(W, t_prev, t_bias, tm, ts, False, k_peak, m) - theta
+            else:
+                fm = _u_at_ms(W, t_prev, tm, ts, k_peak, m,
+                              t_f_prev, i_f_prev, unconsumed) - theta
+            left = fa * fm <= 0.0
+            b_br = torch.where(left, m, b_br)
+            fb = torch.where(left, fm, fb)
+            a_br = torch.where(left, a_br, m)
+            fa = torch.where(left, fa, fm)
+
+        m = 0.5 * (a_br + b_br)
+        for _ in range(n_newton):
+            if k == 0:
+                um = _u_at(W, t_prev, t_bias, tm, ts, False, k_peak, m) - theta
+                dum = _du_at(W, t_prev, t_bias, tm, ts, False, k_peak, m)
+            else:
+                um = _u_at_ms(W, t_prev, tm, ts, k_peak, m,
+                              t_f_prev, i_f_prev, unconsumed) - theta
+                dum = _du_at_ms(W, t_prev, tm, ts, k_peak, m,
+                                t_f_prev, i_f_prev, unconsumed)
+            safe = dum > 1e-10
+            nm = m - um / torch.where(safe, dum, torch.ones_like(dum))
+            nm = nm.clamp(min=a_br, max=b_br)
+            m = torch.where(safe, nm, m)
+
+        tf = torch.where(at_first, grid[0], m)
+        tf = torch.where(any_mask, tf, torch.full_like(tf, float("inf")))
+
+        if k == 0:
+            up_k = _du_at(W, t_prev, t_bias, tm, ts, False, k_peak, tf)
+        else:
+            up_k = _du_at_ms(W, t_prev, tm, ts, k_peak, tf,
+                             t_f_prev, i_f_prev, unconsumed)
+
+        fired = any_mask & torch.isfinite(tf)
+        t_all[:, :, k] = torch.where(fired, tf, t_all[:, :, k])
+        up_all[:, :, k] = torch.where(fired, up_k, up_all[:, :, k])
+        if k == 0:
+            t_post = torch.where(fired, tf, t_post)
+            up = torch.where(fired, up_k, up)
+
+        if not fired.any():
+            break
+
+        if n_in:
+            t_prev_bt = t_prev.t()
+            consumed_now = t_prev_bt.unsqueeze(0) <= tf.unsqueeze(-1)
+            dt_f = (tf.unsqueeze(-1) - t_prev_bt.unsqueeze(0)).clamp(min=0.0)
+            exp_dt = torch.exp(-b_inv * dt_f)
+            i_f_input = (W[:, :n_in].unsqueeze(1) * exp_dt * consumed_now.float()).sum(dim=2)
+        else:
+            i_f_input = torch.zeros_like(tf)
+        i_f_bias = W[:, n_in].unsqueeze(1) * torch.exp(-b_inv * tf)
+        i_f_new = i_f_bias + i_f_input
+
+        if n_in:
+            new_consumed = t_prev_bt.unsqueeze(0) <= tf.unsqueeze(-1)
+            unconsumed = torch.where(fired.unsqueeze(-1),
+                                     unconsumed & ~new_consumed, unconsumed)
+
+        if n_in:
+            forced = torch.einsum('jbi,ibg->jbg',
+                                  W[:, :n_in].unsqueeze(1) * unconsumed.float(),
+                                  K_grid)
+        else:
+            forced = torch.zeros((n_cur, B, G), dtype=dtype, device=dev)
+        free = i_f_new.unsqueeze(-1) * ts * k_peak * _K(
+            g - tf.unsqueeze(-1), tm, ts, False, k_peak)
+        U_new = free + forced
+
+        U = torch.where(fired.unsqueeze(-1), U_new, U)
+        t_f_prev = torch.where(fired, tf, t_f_prev)
+        i_f_prev = torch.where(fired, i_f_new, i_f_prev)
+
+    return t_post, up, t_all, up_all
+
+
+def backward_multispike_layer_torch(W, t_prev, t_bias, t_all, up_all,
+                                     lam_post, tm, ts, k_peak, t_max, theta):
+    """GPU-vectorized multi-spike backward.
+
+    First-spike gradients use the exact IFT formula (backward_layer_torch).
+    Subsequent spikes use the saltation-corrected IFT: the gradient of spike k
+    is dt_f_k/dW_i = -K(t_f_k - t_i) / u'(t_f_k), which is the same formula
+    but evaluated at the k-th spike time and scaled by the accumulated
+    saltation product.
+
+    For TTFS losses this reduces to backward_layer_torch (only first spike
+    matters). For rate/count losses all spikes contribute.
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    B = t_all.shape[1]
+    K = t_all.shape[2]
+    dev = W.device
+    dtype = W.dtype
+
+    grad = torch.zeros_like(W)
+    lam_prev = torch.zeros((n_in, B), dtype=dtype, device=dev)
+
+    fired_any = torch.isfinite(t_all[:, :, 0])
+    if not fired_any.any():
+        return grad, lam_prev
+
+    for k in range(K):
+        t_fk = t_all[:, :, k]
+        up_k = up_all[:, :, k]
+        fired_k = torch.isfinite(t_fk) & (up_k.abs() > 1e-12)
+        if not fired_k.any():
+            continue
+        la = torch.where(fired_k, lam_post, torch.zeros_like(lam_post))
+        up_safe = torch.where(up_k.abs() > 1e-12, up_k, torch.ones_like(up_k))
+        adj = torch.where(fired_k, la / up_safe, torch.zeros_like(la))
+        grad[:, n_in] += -(adj * _K(t_fk - t_bias, tm, ts, False, k_peak)).sum(dim=1)
+        for i in range(n_in):
+            d = t_fk - t_prev[i].view(1, -1)
+            Kd_val = _K(d, tm, ts, False, k_peak)
+            grad[:, i] += -(adj * Kd_val).sum(dim=1)
+            if k == 0:
+                lam_prev[i, :] += (adj * W[:, i].view(-1, 1) *
+                                   _Kd(d, tm, ts, False, k_peak)).sum(dim=0)
+
+    return grad, lam_prev
+
+
 def peak_margin_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak):
     """Refined extremum (time, potential) per neuron over the RESPONSE window.
 
@@ -665,9 +883,9 @@ class TTFSNetTorch:
         cache_all = []
         cache_up_all = []
         for l in range(self.n_layers):
-            t_post, up, t_all, up_all = forward_multispike_layer(
+            t_post, up, t_all, up_all = forward_multispike_layer_torch(
                 self.W[l], t, self.t_bias, self.tm, self.ts, self.theta,
-                self.k_peak, self.t_max, max_spikes=20)
+                self.k_peak, self.t_max, self.grid, max_spikes=20)
             cache_first.append((t, t_post, up))
             cache_all.append(t_all)
             cache_up_all.append(up_all)
@@ -678,11 +896,10 @@ class TTFSNetTorch:
         return t
 
     def backward_multispike(self, dL_dt_out):
-        """Multi-spike backward: exact weight gradients through ALL resets.
+        """Multi-spike backward: GPU-vectorized weight gradients through ALL resets.
 
-        Uses ResetLIF.sensitivity_all for weight gradients (saltation matrix
-        at every reset) and IFT formula for input-time adjoint (exact for
-        first-spike TTFS loss).
+        Uses backward_multispike_layer_torch for vectorized computation.
+        First-spike adjoint (lam_prev) is computed from the first spike only.
         """
         grads = [None] * self.n_layers
         lam = dL_dt_out
@@ -690,7 +907,7 @@ class TTFSNetTorch:
             t_prev, t_post, up = self._cache[l]
             t_all = self._cache_all[l]
             up_all = self._cache_up_all[l]
-            g, lam = backward_multispike_layer(
+            g, lam = backward_multispike_layer_torch(
                 self.W[l], t_prev, self.t_bias, t_all, up_all, lam,
                 self.tm, self.ts, self.k_peak, self.t_max, self.theta)
             grads[l] = g
@@ -701,6 +918,30 @@ class TTFSNetTorch:
         t_out = self.forward_multispike(t_in)
         loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
         grads = self.backward_multispike(dL_dt_out)
+        return loss, grads, t_out
+
+    def loss_and_grads_rate(self, t_in, y):
+        """Multi-spike forward + spike-count CE + multi-spike backward.
+
+        Uses rate-based classification: output with the most spikes wins.
+        """
+        t_out = self.forward_multispike(t_in)
+        cache = getattr(self, '_cache_all', None)
+        t_out_all = cache[-1] if cache is not None else t_out.unsqueeze(-1)
+        loss, dL_dc = spike_count_cross_entropy(t_out_all, y)
+        dL_dt = torch.zeros_like(t_out)
+        for b in range(t_out.shape[1]):
+            dL_dt[:, b] = dL_dc[:, b] * (1.0 / (self.t_max + 1.0))
+        grads = self.backward_multispike(dL_dt)
+        return loss, grads, t_out
+
+    def loss_and_grads_rate_latency(self, t_in, y):
+        """Multi-spike forward + combined rate-latency loss + multi-spike backward."""
+        t_out = self.forward_multispike(t_in)
+        cache = getattr(self, '_cache_all', None)
+        t_out_all = cache[-1] if cache is not None else t_out.unsqueeze(-1)
+        loss, dL_dt = rate_latency_loss(t_out_all, y, self.t_max, self.beta)
+        grads = self.backward_multispike(dL_dt)
         return loss, grads, t_out
 
     def existence_grads(self, t_in, y, T_noise=1.0, lam=1.0,

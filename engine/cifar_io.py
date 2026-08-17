@@ -57,6 +57,42 @@ def encode_times(X, t_lo=0.5, t_hi=8.0):
     return t_lo + (t_hi - t_lo) * (1.0 - x)
 
 
+def encode_rate(X, t_lo=0.5, t_hi=8.0, max_spikes=10):
+    """Rate coding: each input fires 0..max_spikes times proportional to value.
+
+    Bright pixel -> more spikes. Spike times are uniformly spaced in [t_lo, t_hi].
+    Returns (N, n_in, max_spikes) float64 spike times (inf = no spike at that slot).
+    """
+    x = X.reshape(X.shape[0], -1).clip(0.0, 1.0)
+    N, n_in = x.shape
+    n_spikes = np.ceil(x * max_spikes).astype(np.int64)
+    times = np.full((N, n_in, max_spikes), np.inf, dtype=np.float64)
+    for s in range(max_spikes):
+        times[:, :, s] = t_lo + (t_hi - t_lo) * (s + 0.5) / max_spikes
+    slot_idx = np.arange(max_spikes)[None, None, :]
+    times = np.where(slot_idx < n_spikes[:, :, None], times, np.inf)
+    return times
+
+
+def encode_temporal(X, t_lo=0.5, t_hi=8.0, max_spikes=5, burst_gap=0.3):
+    """Temporal (burst) coding: each input fires 1..max_spikes spikes in a burst.
+
+    Brighter pixels get shorter inter-spike intervals within the burst (faster burst).
+    Spike 1 at t_hi*(1-val) (like TTFS), subsequent spikes at burst_gap intervals.
+    Returns (N, n_in, max_spikes) float64 spike times (inf = no spike at that slot).
+    """
+    x = X.reshape(X.shape[0], -1).clip(0.0, 1.0)
+    N, n_in = x.shape
+    n_burst = np.clip(np.ceil(x * max_spikes).astype(np.int64), 1, max_spikes)
+    times = np.full((N, n_in, max_spikes), np.inf, dtype=np.float64)
+    t_first = t_lo + (t_hi - t_lo) * (1.0 - x)
+    for s in range(max_spikes):
+        times[:, :, s] = t_first + s * burst_gap
+    slot_idx = np.arange(max_spikes)[None, None, :]
+    times = np.where(slot_idx < n_burst[:, :, None], times, np.inf)
+    return times
+
+
 def subset(seed, X, y, n_train):
     """Deterministic stratified subset of n_train samples per class (balanced)."""
     n_cls = 10

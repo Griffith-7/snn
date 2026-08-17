@@ -12,7 +12,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from snn_torch import TTFSNetTorch, forward_multispike_layer, backward_multispike_layer
+from snn_torch import TTFSNetTorch, forward_multispike_layer, forward_multispike_layer_torch, backward_multispike_layer
 from losses_torch import latency_cross_entropy
 from reset_lif import ResetLIF
 
@@ -38,8 +38,8 @@ def gradient_check_multispike(sizes=(144, 64, 10), B=4, t_max=40.0,
     W = net.W[layer].detach().clone().requires_grad_(True)
     t_prev, t_post, up = net._cache[layer]
 
-    t_post_ms, up_ms, t_all_ms, up_all_ms = forward_multispike_layer(
-        W, t_prev, net.t_bias, tm, ts, theta, net.k_peak, t_max, max_spikes=20)
+    t_post_ms, up_ms, t_all_ms, up_all_ms = forward_multispike_layer_torch(
+        W, t_prev, net.t_bias, tm, ts, theta, net.k_peak, t_max, net.grid, max_spikes=20)
 
     n_fires = int(fired_mask.sum().item()) if (fired_mask := torch.isfinite(t_post_ms)).any() else 0
     max_sp = int(torch.isfinite(t_all_ms).sum(dim=2).max().item()) if t_all_ms.numel() > 0 else 0
@@ -58,16 +58,16 @@ def gradient_check_multispike(sizes=(144, 64, 10), B=4, t_max=40.0,
     for idx in test_indices:
         W_plus = W.detach().clone()
         W_plus[idx] += eps
-        t_post_p, _, _, _ = forward_multispike_layer(
-            W_plus, t_prev, net.t_bias, tm, ts, theta, net.k_peak, t_max)
+        t_post_p, _, _, _ = forward_multispike_layer_torch(
+            W_plus, t_prev, net.t_bias, tm, ts, theta, net.k_peak, t_max, net.grid)
         t_p = torch.where(torch.isfinite(t_post_p), t_post_p,
                           torch.tensor(2.0 * t_max, dtype=t_post_p.dtype, device=dev))
         loss_plus = (lam * t_p).sum().item()
 
         W_minus = W.detach().clone()
         W_minus[idx] -= eps
-        t_post_m, _, _, _ = forward_multispike_layer(
-            W_minus, t_prev, net.t_bias, tm, ts, theta, net.k_peak, t_max)
+        t_post_m, _, _, _ = forward_multispike_layer_torch(
+            W_minus, t_prev, net.t_bias, tm, ts, theta, net.k_peak, t_max, net.grid)
         t_m = torch.where(torch.isfinite(t_post_m), t_post_m,
                           torch.tensor(2.0 * t_max, dtype=t_post_m.dtype, device=dev))
         loss_minus = (lam * t_m).sum().item()
@@ -114,7 +114,7 @@ def training_comparison(sizes=(144, 64, 10), n_train=2000, n_test=2000,
 
     for label, use_multispike in [("single-spike", False), ("multi-spike", True)]:
         print(f"\n  --- {label} ---")
-        net = TTFSNetTorch([n_in] + list(sizes[1:]), t_max=t_max, grid_pts=1001,
+        net = TTFSNetTorch([n_in] + list(sizes[1:]), t_max=t_max, grid_pts=401,
                            dtype=torch.float64, dev=dev, seed=seed)
         opt = AdamTorch(net.W, lr=0.02)
 
