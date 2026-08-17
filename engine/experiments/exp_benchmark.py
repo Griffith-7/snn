@@ -279,6 +279,7 @@ def main():
     ap.add_argument("--probe", action="store_true")
     ap.add_argument("--skip-stbp", action="store_true")
     ap.add_argument("--skip-event", action="store_true")
+    ap.add_argument("--skip-exact", action="store_true")
     args = ap.parse_args()
 
     c = dict(epochs=args.epochs, n_train=args.n_train, res=args.res,
@@ -318,9 +319,10 @@ def main():
         return
 
     print("\n=== 1. Exact engine (grid + IFT) ===")
-    r_exact = train_exact(c, ttr, ytr, tte, yte, n_in,
-                          engine_cls=TTFSNetTorch, label="exact")
-    results["runs"].append(r_exact)
+    if not args.skip_exact:
+        r_exact = train_exact(c, ttr, ytr, tte, yte, n_in,
+                              engine_cls=TTFSNetTorch, label="exact")
+        results["runs"].append(r_exact)
 
     if not args.skip_event:
         print("\n=== 2. Event-driven engine ===")

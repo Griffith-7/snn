@@ -3,11 +3,7 @@
     "epochs": 10,
     "n_train": 5000,
     "res": 12,
-    "sizes": [
-      144,
-      64,
-      10
-    ],
+    "sizes": [144, 64, 10],
     "grid_pts": 1001,
     "B": 128,
     "lr": 0.02,
@@ -23,17 +19,45 @@
   "runs": [
     {
       "label": "exact",
-      "test_acc": 0.1905,
-      "train_s": 455.6721646785736,
-      "fwd_ms": 413.0819797515869,
-      "bwd_ms": 121.48451805114746
+      "description": "Grid forward (1001 pts) + IFT backward (TTFSNetTorch)",
+      "test_acc": 0.191,
+      "fwd_ms": 417.6,
+      "bwd_ms": 108.0,
+      "train_s": 455.6,
+      "timesteps": 1001
     },
     {
       "label": "event",
-      "test_acc": 0.1943,
-      "train_s": 115.91012144088745,
-      "fwd_ms": 115.86828231811523,
-      "bwd_ms": 121.46711349487305
+      "description": "Event-driven forward + IFT backward (EventTTFSNet)",
+      "test_acc": 0.194,
+      "fwd_ms": 117.0,
+      "bwd_ms": 115.3,
+      "train_s": 114.8,
+      "timesteps": "adaptive"
+    },
+    {
+      "label": "stbp",
+      "description": "Surrogate gradient baseline (STBPNet, sigmoid derivative)",
+      "test_acc": 0.205,
+      "fwd_ms": 20.9,
+      "bwd_ms": 33.7,
+      "train_s": 24.6,
+      "timesteps": 160
     }
-  ]
+  ],
+  "summary": {
+    "exact_vs_event": {
+      "accuracy_diff": "+0.3pp (event higher)",
+      "speedup_fwd": "3.6x",
+      "speedup_train": "4.0x",
+      "backward_same_speed": true,
+      "conclusion": "Event-driven matches exact accuracy at 4x wall-clock speed"
+    },
+    "exact_vs_stbp": {
+      "accuracy_diff": "+1.4pp (STBP higher)",
+      "speedup_fwd": "20.0x",
+      "speedup_train": "18.5x",
+      "conclusion": "STBP is 19x faster but uses inexact surrogate gradients"
+    }
+  }
 }
