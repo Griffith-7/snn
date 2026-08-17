@@ -3,12 +3,13 @@
 Run:  python engine/experiments/exp_sp01.py
 Writes JSON to docs/results/sp01/ and prints a summary.
 
-E1  forward validation: oracle (NumPy) vs 200k-point dense simulation, and
-    torch/GPU engine vs oracle cross-check.
 E2/E3  exact-gradient check vs central finite differences (2- and 3-layer).
 E4  training smoke test on the torch/GPU engine (synthetic TTFS 2-class task).
-E5  edge cases: gradient scale vs depth, near-grazing dt/dw blow-up,
-    silent-neuron zero gradient.
+E5  edge cases: gradient scale vs depth, silent-neuron zero gradient.
+
+Note: E1, E1b, and E5b require the NumPy oracle (engine/snn.py) which has
+been removed. They are kept as reference code but will raise ImportError if
+called without the oracle.
 """
 import json
 import math
@@ -21,7 +22,6 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from snn import DoubleExpKernel, forward_layer_batch, _refine_peak  # NumPy oracle
 from snn_torch import TTFSNetTorch, forward_layer_torch, device, _K, _Kd
 from losses_torch import latency_cross_entropy
 from optimizers_torch import AdamTorch
@@ -201,6 +201,7 @@ def _gradcheck_torch(depth, seed, n_in=8, widths=None, B=8, eps=1e-5,
 
 def e1_forward_vs_dense(tm=15.0, ts=4.0, theta=1.0, t_max=40.0, seed=0):
     """NumPy oracle spike times vs a 200k-point dense simulation reference."""
+    from snn import DoubleExpKernel, forward_layer_batch
     k = DoubleExpKernel(tm, ts)
     rng = np.random.default_rng(seed)
     n_in, n_cur, B = 5, 8, 4
@@ -335,6 +336,7 @@ def e5a_grad_scale_vs_depth(seed=0, B=8, n_in=8, n_out=4, max_depth=5):
 
 def e5b_edge_near_grazing():
     """dt/dw blow-up when u'(t_f) ~ 0 (NumPy oracle, exact root finding)."""
+    from snn import DoubleExpKernel, forward_layer_batch, _refine_peak
     tm, ts, theta, t_max = 15.0, 4.0, 1.0, 40.0
     k = DoubleExpKernel(tm, ts)
     t_in = np.array([5.0, 8.0])
@@ -485,14 +487,22 @@ def main():
     report = {"experiments": {}, "meta": {"device": str(torch.cuda.get_device_name(0)) if torch.cuda.is_available() else "cpu"}}
 
     print("=== E1: oracle forward vs 200k-point dense simulation ===")
-    e1 = e1_forward_vs_dense()
-    print(json.dumps(e1, indent=2))
-    report["experiments"]["E1_oracle_vs_dense"] = e1
+    try:
+        e1 = e1_forward_vs_dense()
+        print(json.dumps(e1, indent=2))
+        report["experiments"]["E1_oracle_vs_dense"] = e1
+    except ImportError:
+        print("  SKIPPED (NumPy oracle not available)")
+        report["experiments"]["E1_oracle_vs_dense"] = {"skip": "oracle removed"}
 
     print("=== E1b: torch/GPU forward vs NumPy oracle ===")
-    e1b = e1b_torch_vs_oracle()
-    print(json.dumps(e1b, indent=2))
-    report["experiments"]["E1b_torch_vs_oracle"] = e1b
+    try:
+        e1b = e1b_torch_vs_oracle()
+        print(json.dumps(e1b, indent=2))
+        report["experiments"]["E1b_torch_vs_oracle"] = e1b
+    except ImportError:
+        print("  SKIPPED (NumPy oracle not available)")
+        report["experiments"]["E1b_torch_vs_oracle"] = {"skip": "oracle removed"}
 
     print("=== E2: gradient check (2-layer, torch/GPU) ===")
     e2 = []
@@ -552,9 +562,13 @@ def main():
     report["experiments"]["E5a_grad_scale_vs_depth"] = e5a
 
     print("=== E5b: near-grazing dt/dw ===")
-    e5b = e5b_edge_near_grazing()
-    print(json.dumps(e5b, indent=2))
-    report["experiments"]["E5b_near_grazing"] = e5b
+    try:
+        e5b = e5b_edge_near_grazing()
+        print(json.dumps(e5b, indent=2))
+        report["experiments"]["E5b_near_grazing"] = e5b
+    except ImportError:
+        print("  SKIPPED (NumPy oracle not available)")
+        report["experiments"]["E5b_near_grazing"] = {"skip": "oracle removed"}
 
     print("=== E5c: silent neuron zero gradient ===")
     e5c = e5c_edge_silent_zero_grad()
