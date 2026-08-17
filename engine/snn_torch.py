@@ -210,85 +210,143 @@ def backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up, tm, ts, alpha,
 
 
 def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
-                              alpha, k_peak, t_max, theta=1.0):
-    """SP-03 saltation backward — GPU-vectorized fast path.
+                              alpha, k_peak, t_max, theta=1.0,
+                              t_all=None, up_all=None):
+    """SP-03 saltation backward with multi-spike support.
 
-    For the first spike (no intermediate resets before t_post), the IFT
-    formula is exact because the no-reset and reset trajectories are
-    identical until the first crossing.  The grid forward always returns
-    the first crossing, so this fast path covers the entire current
-    training pipeline at the same speed as backward_layer_torch.
-
-    For multi-spike regimes (future reset-LIF forward), use
-    _backward_saltation_full() which runs the full ResetLIF sensitivity.
+    When t_all/up_all are provided (from forward_multispike_layer), uses
+    ResetLIF.sensitivity_all for exact weight gradients through ALL resets.
+    When not provided, falls back to the single-spike IFT (backward_layer_torch).
     """
+    if t_all is not None and up_all is not None:
+        return backward_multispike_layer(W, t_prev, t_bias, t_all, up_all,
+                                         lam_post, tm, ts, k_peak, t_max, theta)
     return backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up,
                                 tm, ts, alpha, k_peak)
 
 
-def _backward_saltation_full(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
-                             k_peak, t_max, theta):
-    """Full SP-03 saltation backward — for multi-spike regimes.
+def forward_multispike_layer(W, t_prev, t_bias, tm, ts, theta, k_peak,
+                              t_max, max_spikes=20):
+    """Multi-spike forward using ResetLIF for every (neuron, sample).
 
-    Uses ResetLIF.sensitivity_first_spike (vectorized numpy, early exit)
-    for weight gradients, and the IFT formula for input-time gradients.
-    Falls back to CPU for the per-neuron-per-sample loop.
+    Simulates the full LIF+reset dynamics. Returns first-spike tensors
+    (t_post, up) compatible with the single-spike pipeline PLUS the full
+    spike train (t_all, up_all) for the multi-spike backward.
+
+    Returns:
+        t_post, up: (n_cur, B) first-spike time and u' (inf / 0 if silent)
+        t_all: (n_cur, B, max_spikes) all spike times, padded with inf
+        up_all: (n_cur, B, max_spikes) u' at each spike, 0 for padding
     """
     n_cur, n_inp = W.shape
     n_in = n_inp - 1
-    B = t_post.shape[1]
+    B = t_prev.shape[1]
+    dev = W.device
+    dtype = W.dtype
+    lif = ResetLIF(tm=tm, ts=ts, theta=theta * ts * k_peak)
+
+    t_post = torch.full((n_cur, B), float("inf"), dtype=dtype, device=dev)
+    up = torch.zeros((n_cur, B), dtype=dtype, device=dev)
+    t_all = torch.full((n_cur, B, max_spikes), float("inf"), dtype=dtype, device=dev)
+    up_all = torch.zeros((n_cur, B, max_spikes), dtype=dtype, device=dev)
+
+    W_np = W.detach().cpu().numpy().astype(np.float64)
+    t_prev_np = t_prev.detach().cpu().numpy().astype(np.float64)
+
+    for j in range(n_cur):
+        for b in range(B):
+            inputs = []
+            for i in range(n_in):
+                tv = float(t_prev_np[i, b]) if np.isfinite(t_prev_np[i, b]) else t_max
+                inputs.append((tv, float(W_np[j, i])))
+            inputs.append((0.0, float(W_np[j, n_in])))
+
+            fires, ups = lif.run_with_state(inputs, t_end=t_max)
+            for k, (tf, upv) in enumerate(zip(fires, ups)):
+                if k >= max_spikes:
+                    break
+                t_all[j, b, k] = tf
+                up_all[j, b, k] = upv
+            if fires:
+                t_post[j, b] = fires[0]
+                up[j, b] = ups[0]
+
+    return t_post, up, t_all, up_all
+
+
+def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
+                               tm, ts, k_peak, t_max, theta):
+    """Multi-spike backward using ResetLIF.sensitivity_all.
+
+    Computes exact weight gradients through ALL resets using the saltation
+    matrix. Input-time adjoint uses the IFT formula on the first spike
+    (exact for first-spike TTFS loss).
+
+    Args:
+        W: (n_cur, n_in+1)
+        t_prev: (n_in, B) input spike times
+        t_all: (n_cur, B, K) all output spike times (from forward_multispike)
+        up_all: (n_cur, B, K) u' at each spike
+        lam_post: (n_cur, B) = dL/dt_first_spike (from loss)
+
+    Returns:
+        grad: (n_cur, n_in+1) weight gradient
+        lam_prev: (n_in, B) adjoint into previous layer's spike times
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    B = t_all.shape[1]
+    K = t_all.shape[2]
     dev = W.device
     dtype = W.dtype
 
     grad = torch.zeros_like(W)
     lam_prev = torch.zeros((n_in, B), dtype=dtype, device=dev)
 
-    fired = torch.isfinite(t_post)
-    if not fired.any():
-        return grad, lam_prev
-
     lif = ResetLIF(tm=tm, ts=ts, theta=theta * ts * k_peak)
 
     W_np = W.detach().cpu().numpy().astype(np.float64)
     t_prev_np = t_prev.detach().cpu().numpy().astype(np.float64)
-    t_post_np = t_post.detach().cpu().numpy().astype(np.float64)
-    up_np = up.detach().cpu().numpy().astype(np.float64)
     lam_np = lam_post.detach().cpu().numpy().astype(np.float64)
+    t_all_np = t_all.detach().cpu().numpy().astype(np.float64)
+    up_all_np = up_all.detach().cpu().numpy().astype(np.float64)
 
     grad_np = np.zeros_like(W_np)
+    lam_prev_np = np.zeros((n_in, B), dtype=np.float64)
 
     for j in range(n_cur):
         for b in range(B):
             lam_jb = lam_np[j, b]
-            if lam_jb == 0.0 or not np.isfinite(t_post_np[j, b]):
+            if lam_jb == 0.0:
                 continue
-            if abs(up_np[j, b]) < 1e-12:
+            if not np.isfinite(t_all_np[j, b, 0]):
                 continue
 
             inputs = []
             for i in range(n_in):
-                t_val = float(t_prev_np[i, b]) if np.isfinite(t_prev_np[i, b]) else t_max
-                inputs.append((t_val, float(W_np[j, i])))
+                tv = float(t_prev_np[i, b]) if np.isfinite(t_prev_np[i, b]) else t_max
+                inputs.append((tv, float(W_np[j, i])))
             inputs.append((0.0, float(W_np[j, n_in])))
 
-            fire_t, dtdw = lif.sensitivity_first_spike(inputs, t_end=t_max)
-            if fire_t is None:
-                continue
-            grad_np[j, :] += lam_jb * dtdw
+            fires, dtdw_matrix = lif.sensitivity_all(inputs, t_end=t_max)
 
-    lam_prev_np = np.zeros((n_in, B), dtype=np.float64)
-    for j in range(n_cur):
-        m_j = lam_np[j] != 0.0
-        m_j &= np.isfinite(t_post_np[j])
-        m_j &= np.abs(up_np[j]) > 1e-12
-        if not m_j.any():
-            continue
-        td = t_post_np[j:j+1, :] - t_prev_np
-        valid = m_j[np.newaxis, :] & np.isfinite(t_prev_np) & (td > 0)
-        d = np.where(valid, td, 0.0)
-        kd = (-np.exp(-d / tm) / tm + np.exp(-d / ts) / ts) / (tm - ts) / k_peak
-        dt_dtin = W_np[j:j+1, :n_in] * kd / up_np[j:j+1, :]
-        lam_prev_np += (lam_np[j:j+1, :] * dt_dtin * valid)
+            n_fires = len(fires)
+            dL_dt_first = lam_jb
+            if n_fires > 0 and abs(up_all_np[j, b, 0]) > 1e-12:
+                dtdw_first = np.array(dtdw_matrix[0], dtype=np.float64)
+                finite = np.isfinite(dtdw_first)
+                grad_np[j, finite] += dL_dt_first * dtdw_first[finite]
+
+            td_first = fires[0] - t_prev_np[:, b] if n_fires > 0 else np.full(n_in, np.inf)
+            valid_first = (np.isfinite(td_first) & (td_first > 0) &
+                           np.isfinite(t_prev_np[:, b]))
+            if n_fires > 0 and abs(up_all_np[j, b, 0]) > 1e-12:
+                d = np.where(valid_first, td_first, 0.0)
+                tm_val, ts_val = lif.tm, lif.ts
+                kd = (-np.exp(-d / tm_val) / tm_val +
+                      np.exp(-d / ts_val) / ts_val) / (tm_val - ts_val) / k_peak
+                dt_dtin = W_np[j, :n_in] * kd / up_all_np[j, b, 0]
+                lam_prev_np[:, b] += dL_dt_first * dt_dtin * valid_first
 
     grad = torch.tensor(grad_np, dtype=dtype, device=dev)
     lam_prev = torch.tensor(lam_prev_np, dtype=dtype, device=dev)
@@ -552,15 +610,24 @@ class TTFSNetTorch:
         return grads
 
     def backward_saltation(self, dL_dt_out):
-        """SP-03 saltation backward: exact weight gradients through resets."""
+        """SP-03 saltation backward: exact weight gradients through resets.
+
+        Uses multi-spike cache (from forward_multispike) when available,
+        otherwise falls back to single-spike IFT.
+        """
         grads = [None] * self.n_layers
         lam = dL_dt_out
         for l in reversed(range(self.n_layers)):
             t_prev, t_post, up = self._cache[l]
+            t_all = getattr(self, '_cache_all', None)
+            up_all = getattr(self, '_cache_up_all', None)
+            t_all_l = t_all[l] if t_all is not None else None
+            up_all_l = up_all[l] if up_all is not None else None
             g, lam = backward_layer_saltation(
                 self.W[l], t_prev, self.t_bias, t_post, lam, up,
                 self.tm, self.ts, self._alpha, self.k_peak,
-                self.t_max, self.theta)
+                self.t_max, self.theta,
+                t_all=t_all_l, up_all=up_all_l)
             grads[l] = g
         return grads
 
@@ -575,6 +642,57 @@ class TTFSNetTorch:
         t_out = self.forward(t_in)
         loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
         grads = self.backward(dL_dt_out)
+        return loss, grads, t_out
+
+    def forward_multispike(self, t_in):
+        """Multi-spike forward: simulates ALL spikes through ALL resets.
+
+        Returns (t_out, t_all_cache, up_all_cache) where:
+          t_out: (n_out, B) first-spike times (for loss computation)
+          t_all_cache[l]: (n_cur, B, K) all spike times at layer l
+          up_all_cache[l]: (n_cur, B, K) u' at each spike at layer l
+        """
+        t = t_in
+        cache_first = []
+        cache_all = []
+        cache_up_all = []
+        for l in range(self.n_layers):
+            t_post, up, t_all, up_all = forward_multispike_layer(
+                self.W[l], t, self.t_bias, self.tm, self.ts, self.theta,
+                self.k_peak, self.t_max, max_spikes=20)
+            cache_first.append((t, t_post, up))
+            cache_all.append(t_all)
+            cache_up_all.append(up_all)
+            t = t_post
+        self._cache = cache_first
+        self._cache_all = cache_all
+        self._cache_up_all = cache_up_all
+        return t
+
+    def backward_multispike(self, dL_dt_out):
+        """Multi-spike backward: exact weight gradients through ALL resets.
+
+        Uses ResetLIF.sensitivity_all for weight gradients (saltation matrix
+        at every reset) and IFT formula for input-time adjoint (exact for
+        first-spike TTFS loss).
+        """
+        grads = [None] * self.n_layers
+        lam = dL_dt_out
+        for l in reversed(range(self.n_layers)):
+            t_prev, t_post, up = self._cache[l]
+            t_all = self._cache_all[l]
+            up_all = self._cache_up_all[l]
+            g, lam = backward_multispike_layer(
+                self.W[l], t_prev, self.t_bias, t_all, up_all, lam,
+                self.tm, self.ts, self.k_peak, self.t_max, self.theta)
+            grads[l] = g
+        return grads
+
+    def loss_and_grads_multispike(self, t_in, y):
+        """Forward (multi-spike) + latency CE + multi-spike backward."""
+        t_out = self.forward_multispike(t_in)
+        loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
+        grads = self.backward_multispike(dL_dt_out)
         return loss, grads, t_out
 
     def existence_grads(self, t_in, y, T_noise=1.0, lam=1.0,
