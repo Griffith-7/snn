@@ -134,7 +134,7 @@ def predict_stbp(net, t, y, B):
     return float(np.mean(pred == y))
 
 
-def measure_speed_engine(net, t, B, n_warmup=2, n_reps=5):
+def measure_speed_engine(net, t, B, use_saltation=False, n_warmup=2, n_reps=5):
     dev, dtype = net.dev, net.dtype
     tb = torch.tensor(t[:B].T, dtype=dtype, device=dev)
     yy = torch.tensor(np.zeros(B, dtype=np.int64), device=dev)
@@ -148,7 +148,10 @@ def measure_speed_engine(net, t, B, n_warmup=2, n_reps=5):
     fwd_ms = (time.time() - t0) / n_reps * 1000
     t0 = time.time()
     for _ in range(n_reps):
-        loss, grads, _ = net.loss_and_grads(tb, yy)
+        if use_saltation:
+            net.loss_and_grads_saltation(tb, yy)
+        else:
+            net.loss_and_grads(tb, yy)
     torch.cuda.synchronize()
     total_ms = (time.time() - t0) / n_reps * 1000
     return fwd_ms, total_ms - fwd_ms
@@ -224,6 +227,38 @@ def train_exact(c, ttr, ytr, tte, yte, n_in, engine_cls=TTFSNetTorch, label="exa
                 fwd_ms=fwd_ms, bwd_ms=bwd_ms)
 
 
+def train_saltation(c, ttr, ytr, tte, yte, n_in, engine_cls=TTFSNetTorch,
+                    label="saltation"):
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sizes = [n_in] + c["sizes"][1:]
+    net = engine_cls(sizes, t_max=40.0, w_scale=c["w_scale"],
+                     bias_val=c["bias_val"], seed=c["seed"],
+                     grid_pts=c["grid_pts"], dev=dev, beta=c["beta"])
+    net.W = positive_init(sizes, c["bias_val"], c["seed"], net.dtype, dev)
+    opt = AdamTorch(net.W, lr=c["lr"], clip=5.0)
+    B = c["B"]
+    rng = np.random.default_rng(c["seed"] + 777)
+    n_eval = min(2000, yte.shape[0])
+    idx_eval = rng.choice(yte.shape[0], n_eval, replace=False)
+    t0 = time.time()
+    for ep in range(c["epochs"]):
+        perm = rng.permutation(ytr.shape[0])
+        for s in range(0, ytr.shape[0], B):
+            idx = perm[s:s + B]
+            t_in = torch.tensor(ttr[idx].T, dtype=net.dtype, device=dev)
+            yy = torch.tensor(ytr[idx], device=dev)
+            loss, grads, _ = net.loss_and_grads_saltation(t_in, yy)
+            opt.step(net.W, grads)
+        if ep % 5 == 0 or ep == c["epochs"] - 1:
+            acc = predict_engine(net, tte[idx_eval], yte[idx_eval], B)
+            print(f"  [{label}] ep {ep:3d}: test {acc:.3f}")
+    acc = predict_engine(net, tte, yte, B)
+    wall = time.time() - t0
+    fwd_ms, bwd_ms = measure_speed_engine(net, ttr, B, use_saltation=True)
+    return dict(label=label, test_acc=acc, train_s=wall,
+                fwd_ms=fwd_ms, bwd_ms=bwd_ms)
+
+
 def train_stbp(c, ttr, ytr, tte, yte, n_in):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     sizes = [n_in] + c["sizes"][1:]
@@ -280,6 +315,7 @@ def main():
     ap.add_argument("--skip-stbp", action="store_true")
     ap.add_argument("--skip-event", action="store_true")
     ap.add_argument("--skip-exact", action="store_true")
+    ap.add_argument("--skip-saltation", action="store_true")
     args = ap.parse_args()
 
     c = dict(epochs=args.epochs, n_train=args.n_train, res=args.res,
@@ -330,8 +366,13 @@ def main():
                               engine_cls=EventTTFSNet, label="event")
         results["runs"].append(r_event)
 
+    if not args.skip_saltation:
+        print("\n=== 3. SP-03 saltation backward ===")
+        r_salt = train_saltation(c, ttr, ytr, tte, yte, n_in, label="saltation")
+        results["runs"].append(r_salt)
+
     if not args.skip_stbp:
-        print("\n=== 3. Surrogate gradient (STBP) ===")
+        print("\n=== 4. Surrogate gradient (STBP) ===")
         r_stbp = train_stbp(c, ttr, ytr, tte, yte, n_in)
         results["runs"].append(r_stbp)
 

@@ -1,6 +1,3 @@
 {
-  "E1_gradient_check": {
-    "pass": true,
-    "max_rel_error": 1.6568194224650498e-10
-  }
+  "E1_gradient_check": "PASS"
 }

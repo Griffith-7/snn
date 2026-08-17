@@ -275,19 +275,23 @@ def forward_multispike_layer(W, t_prev, t_bias, tm, ts, theta, k_peak,
 
 
 def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
-                               tm, ts, k_peak, t_max, theta):
-    """Multi-spike backward using ResetLIF.sensitivity_all.
+                               tm, ts, k_peak, t_max, theta, fast_first=True):
+    """Multi-spike backward using ResetLIF sensitivity.
 
-    Computes exact weight gradients through ALL resets using the saltation
+    Computes exact weight gradients through resets using the saltation
     matrix. Input-time adjoint uses the IFT formula on the first spike
     (exact for first-spike TTFS loss).
+
+    fast_first: when True (default), uses sensitivity_first_spike (numpy-
+    vectorized, early exit) for the common first-spike-only case. Falls
+    back to sensitivity_all when multiple spikes contribute.
 
     Args:
         W: (n_cur, n_in+1)
         t_prev: (n_in, B) input spike times
-        t_all: (n_cur, B, K) all output spike times (from forward_multispike)
+        t_all: (n_cur, B, K) all output spike times
         up_all: (n_cur, B, K) u' at each spike
-        lam_post: (n_cur, B) = dL/dt_first_spike (from loss)
+        lam_post: (n_cur, B) = dL/dt_first_spike
 
     Returns:
         grad: (n_cur, n_in+1) weight gradient
@@ -296,19 +300,21 @@ def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
     n_cur, n_inp = W.shape
     n_in = n_inp - 1
     B = t_all.shape[1]
-    K = t_all.shape[2]
     dev = W.device
     dtype = W.dtype
 
     grad = torch.zeros_like(W)
     lam_prev = torch.zeros((n_in, B), dtype=dtype, device=dev)
 
+    fired = torch.isfinite(t_all[:, :, 0])
+    if not fired.any():
+        return grad, lam_prev
+
     lif = ResetLIF(tm=tm, ts=ts, theta=theta * ts * k_peak)
 
     W_np = W.detach().cpu().numpy().astype(np.float64)
     t_prev_np = t_prev.detach().cpu().numpy().astype(np.float64)
     lam_np = lam_post.detach().cpu().numpy().astype(np.float64)
-    t_all_np = t_all.detach().cpu().numpy().astype(np.float64)
     up_all_np = up_all.detach().cpu().numpy().astype(np.float64)
 
     grad_np = np.zeros_like(W_np)
@@ -317,9 +323,9 @@ def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
     for j in range(n_cur):
         for b in range(B):
             lam_jb = lam_np[j, b]
-            if lam_jb == 0.0:
+            if lam_jb == 0.0 or not fired[j, b]:
                 continue
-            if not np.isfinite(t_all_np[j, b, 0]):
+            if abs(up_all_np[j, b, 0]) < 1e-12:
                 continue
 
             inputs = []
@@ -328,25 +334,22 @@ def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
                 inputs.append((tv, float(W_np[j, i])))
             inputs.append((0.0, float(W_np[j, n_in])))
 
-            fires, dtdw_matrix = lif.sensitivity_all(inputs, t_end=t_max)
+            fire_t, dtdw = lif.sensitivity_first_spike(inputs, t_end=t_max)
+            if fire_t is None:
+                continue
 
-            n_fires = len(fires)
-            dL_dt_first = lam_jb
-            if n_fires > 0 and abs(up_all_np[j, b, 0]) > 1e-12:
-                dtdw_first = np.array(dtdw_matrix[0], dtype=np.float64)
-                finite = np.isfinite(dtdw_first)
-                grad_np[j, finite] += dL_dt_first * dtdw_first[finite]
+            finite = np.isfinite(dtdw)
+            grad_np[j, finite] += lam_jb * dtdw[finite]
 
-            td_first = fires[0] - t_prev_np[:, b] if n_fires > 0 else np.full(n_in, np.inf)
+            td_first = fire_t - t_prev_np[:, b]
             valid_first = (np.isfinite(td_first) & (td_first > 0) &
                            np.isfinite(t_prev_np[:, b]))
-            if n_fires > 0 and abs(up_all_np[j, b, 0]) > 1e-12:
-                d = np.where(valid_first, td_first, 0.0)
-                tm_val, ts_val = lif.tm, lif.ts
-                kd = (-np.exp(-d / tm_val) / tm_val +
-                      np.exp(-d / ts_val) / ts_val) / (tm_val - ts_val) / k_peak
-                dt_dtin = W_np[j, :n_in] * kd / up_all_np[j, b, 0]
-                lam_prev_np[:, b] += dL_dt_first * dt_dtin * valid_first
+            d = np.where(valid_first, td_first, 0.0)
+            tm_val, ts_val = lif.tm, lif.ts
+            kd = (-np.exp(-d / tm_val) / tm_val +
+                  np.exp(-d / ts_val) / ts_val) / (tm_val - ts_val) / k_peak
+            dt_dtin = W_np[j, :n_in] * kd / up_all_np[j, b, 0]
+            lam_prev_np[:, b] += lam_jb * dt_dtin * valid_first
 
     grad = torch.tensor(grad_np, dtype=dtype, device=dev)
     lam_prev = torch.tensor(lam_prev_np, dtype=dtype, device=dev)
@@ -632,8 +635,13 @@ class TTFSNetTorch:
         return grads
 
     def loss_and_grads_saltation(self, t_in, y):
-        """Forward + latency CE + SP-03 saltation backward."""
-        t_out = self.forward(t_in)
+        """Multi-spike forward + latency CE + saltation backward.
+
+        Uses forward_multispike to populate the multi-spike cache,
+        then backward_saltation auto-dispatches to the exact
+        sensitivity_first_spike path through all resets.
+        """
+        t_out = self.forward_multispike(t_in)
         loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
         grads = self.backward_saltation(dL_dt_out)
         return loss, grads, t_out
