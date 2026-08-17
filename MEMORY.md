@@ -4,10 +4,10 @@ This file is the persistent record of the project. Every session: (1) read it, (
 
 ## Project state (current)
 
-- **Active sub-problem:** SP-06 complete — event-driven exact forward delivers 5–13× speedup
-  while being mathematically equivalent to the grid engine. All 6 gates (F1–F6) PASS.
-  Next: P2 (portable closed-form peak + plateau guard) → P3 (multi-spike saltation) →
-  P4 (benchmark vs EventProp/surrogate).
+- **Active sub-problem:** SP-06 complete + SP-03 Path A integration PASS.
+  Event-driven exact forward delivers 5–13× speedup. SP-03 saltation backward
+  integrated into TTFSNetTorch (E1/E2 both PASS at machine precision). All gates green.
+  Next: P2 (portable closed-form peak + plateau guard) → P4 (benchmark vs EventProp/surrogate).
   - **CIFAR-10 (15k/40, seeds 0–2):** engine `ref` **0.273 / 0.261 / 0.250** vs **tuned** STBP
     baseline **0.249 / 0.231 / 0.252** (re-measured 2026-08-16 — the earlier per-seed
     "0.270/0.264/0.265" was not reproducible and is superseded; see fact 23) — engine ≥ baseline at
@@ -82,6 +82,8 @@ This file is the persistent record of the project. Every session: (1) read it, (
 
 24. **Event-driven exact forward delivers 5–13× speedup with mathematically equivalent results (SP-06, 2026-08-17).** `EventTTFSNet(TTFSNetTorch)` drop-in override computes closed-form first-crossing (interval coefficients A,B via prefix sums over sorted input times; critical time t* = (TM·TS/(TM−TS))·ln(−B·TM/(A·TS)); per-interval bisection+clamped Newton) and exact peak-margin (candidates: interior critical points + boundaries + input event kinks; degenerate-tie earliest-time tie-break). Found the grid engine's own accuracy gap: **grid's 0.04-time-spacing misses narrow positive bumps** that the event engine computes exactly — worst case: grid u_peak −3.38 vs event/oracle +7.5e-4 (85× relative error); all 33 sampled oracle cases verified event-correct against a 2M-point direct kernel scan (max event scan error <5e-7). Validation gates (G1–G5) all pass; speed (RTX 3050, CUDA, float64, B=64): forward 5.0×/13.2×, existence 2.6×/5.8×, local_deep 2.6×/6.1× at grid_pts=1001/4001 (event ms constant across grid resolutions). The engine's accuracy-at-scale ceiling is lifted: 4001-point grid quality at 1001-point cost.
 
+25. **ResetLIF membrane potential has an extra factor of `ts` relative to the grid engine's `K_raw`.** `ResetLIF._propagate` computes `u(dt) = w * (exp(-dt/ts) - exp(-dt/tm)) / (1 - tm/ts) = w * ts * K_raw(dt)` where `K_raw(d) = (exp(-d/tm) - exp(-d/ts)) / (tm - ts)`. The grid engine uses `_K(d) = K_raw(d) / k_peak`. Therefore `u_ResetLIF = ts * k_peak * u_grid`, and for equivalence the ResetLIF threshold must be `theta * ts * k_peak` (not `theta * k_peak`). This was the root cause of the E1 gradient mismatch (max_rel 1.87 before fix, 1.96e-14 after). The sensitivity formula `dt/dw = -s_u/up` is also correctly scaled: `s_u(t_f) = ts * K_raw(d)` and `up_ResetLIF = ts * k_peak * up_grid`, so `dt/dw = -K_raw/(k_peak * up_grid) = -K_scaled/up_grid`, matching the grid backward.
+
 ## Decisions log
 
 | ID | Decision | Options | Chosen | Date | Reason |
@@ -139,6 +141,20 @@ What was sound in it:
 - Q5: why does the existence channel revive hidden layers but not a collapsed real-data output layer? — **resolved (2026-08-15/16).** Not far-dead distance and not kernel decay (silent outputs sit ≤1.0 below θ; K similar for hidden/output). It is channel strength: output targets only 1/10 of samples (correct-class) and gets no downstream adjoint, so lam=5 is too weak — **lam≥20 revives** the output (diag_sp02_real: lam=20/100 → 0 silent at 4096/8). Fix = **per-layer lam [5,50]** (hidden 5 / output 50, facts 19–20): 0% silent from ep0, seed-robust, and full 15k/40 std-init **test 0.261 (s1) / 0.250 (s2, peak 0.284), 0% silent out/hid** — collapse fixed on real data WITHOUT pos-init across two seeds; engine **≥ the re-measured tuned baseline at seed 1 (0.261 vs 0.231) and tied at seed 2 (0.250 vs 0.252)** (baseline re-measured 2026-08-16, fact 23). Margin-scaling not needed (deficits are small); lam_out sweep {30..80} within noise (knob exhausted).
 
 ## Session log
+
+- 2026-08-17 — **SP-03 Path A Integration: saltation backward wired into TTFSNetTorch (PASS).**
+  Added `backward_layer_saltation()` to `engine/snn_torch.py` — weight gradients via
+  `ResetLIF.sensitivity_all()` (exact through ALL resets using the saltation matrix), input-time
+  gradients via TTFS IFT. Added `backward_saltation()` and `loss_and_grads_saltation()` methods
+  to `TTFSNetTorch`. Integration experiment (`exp_sp03_integration.py`): E1 gradient comparison
+  PASS (max_rel 1.96e-14/1.79e-15, machine precision); E2 training comparison PASS (near-identical
+  loss trajectories, saltation ~5.6× slower due to Python loops vs vectorized torch). Three bugs
+  found and fixed: (1) ResetLIF threshold normalization was `theta * k_peak` but should be
+  `theta * ts * k_peak` — because `ResetLIF._propagate` computes `u(dt) = w * (exp(-dt/ts) -
+  exp(-dt/tm)) / (1 - tm/ts) = w * ts * K_raw(dt)`, so the membrane potential is `ts` times larger
+  than `K_raw` alone; (2) input-time gradient `dt_dtin = -W * Kd / up` had a spurious minus sign
+  (correct formula: `dt_f/dt_in_m = W * K'(d) / up`); (3) `encode_times` returns numpy, not torch —
+  added tensor conversion in training loop. Dead code (duplicate function body after return) removed.
 
 - 2026-08-17 — **SP-06 complete, Gate F PASS.** Event-driven exact forward engine (`engine/event_driven.py`):
   `EventTTFSNet(TTFSNetTorch)` drop-in override computes closed-form first-crossing (A,B interval

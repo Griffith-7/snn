@@ -56,6 +56,14 @@ init. (MEMORY facts 17–20.)
 
 **Gate C verdict:** ⏸️ **N/A under D1** (single-spike TTFS ⇒ the production engine has no reset jump to saltate; the only per-neuron reset is first-spike death, covered by SP-02). **2026-08-17 rigor re-open (minimal multi-spike model):** Gate C **CONFIRMED** for the hard-reset multi-spike LIF — saltation jump map derived (incl. corrected i-row identity + general `u_reset`), fixed-time + spike-time gradient checks pass at ~1e-10..3.4e-10 ≪ 1e-4, no-jump control fails (8.5e-2) proving necessity, grazing documented no-NaN (`python engine/experiments/exp_sp03_saltation.py`, all 8 gates pass; `docs/results/SP-03-saltation-experiments.md`). Q3.1 (additive reset) collapses to the u_reset generalization at exact crossings (u−θ = 0). Remains N/A for the production single-spike engine.
 
+**2026-08-17 Path A Integration (SP-03 → TTFSNetTorch):**
+- [x] `backward_layer_saltation()` in `engine/snn_torch.py` — weight gradients via `ResetLIF.sensitivity_all()` (exact through ALL resets), input-time gradients via TTFS IFT
+- [x] `backward_saltation()` + `loss_and_grads_saltation()` methods on `TTFSNetTorch`
+- [x] **E1 gradient check PASS** — grid vs saltation backward: max_rel 1.96e-14 / 1.79e-15 (machine precision)
+- [x] **E2 training comparison PASS** — near-identical loss trajectories (saltation ~5.6× slower due to Python loops)
+- [x] Bugs fixed: (1) threshold normalization `theta * k_peak` → `theta * ts * k_peak` (ResetLIF membrane is `ts × K_raw`, not `K_raw`); (2) input-time gradient sign error (`-W * Kd / up` → `+W * Kd / up`); (3) numpy→torch tensor conversion in training loop
+- [x] Dead code removed (duplicate function body after return in `backward_layer_saltation`)
+
 ## SP-04 — Temporal + spatial credit assignment (Phase 4, Gate D)
 
 - [x] Candidate comparison + decision D3 recorded (`docs/research/SP-04-research.md` §5; MEMORY.md D3)

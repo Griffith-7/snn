@@ -6,6 +6,12 @@ bisection bracket-refinement + Newton polish in tensor space, so it maps
 directly onto CUDA. Exact IFT gradients dt_f/dw = -K(t_f - t_in)/u'(t_f) are
 propagated with a vectorized adjoint.
 
+SP-03 integration: `backward_layer_saltation()` computes weight gradients
+via `ResetLIF.sensitivity_all()` (forward-mode variational states through
+ALL resets using the saltation matrix Xi_uu = (i_f - u_reset)/(i_f - theta)).
+This is exact for multi-spike regimes and matches the grid adjoint for single-
+spike regimes (verified by gradient check).
+
 The scalar NumPy engine (engine/snn.py) is kept as an independent oracle; the
 experiments cross-check this implementation against it (E1).
 """
@@ -15,6 +21,7 @@ import numpy as np
 import torch
 
 from losses_torch import latency_cross_entropy
+from reset_lif import ResetLIF
 
 
 _DEVICE = None
@@ -199,6 +206,91 @@ def backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up, tm, ts, alpha,
         d = t_post - t_prev[i].view(1, -1)
         grad[:, i] = -(adj * _K(d, tm, ts, alpha, k_peak)).sum(dim=1)
         lam_prev[i, :] = (adj * W[:, i].view(-1, 1) * _Kd(d, tm, ts, alpha, k_peak)).sum(dim=0)
+    return grad, lam_prev
+
+
+def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
+                              alpha, k_peak, t_max, theta=1.0):
+    """SP-03 saltation-based backward for one layer.
+
+    Weight gradients via `ResetLIF.sensitivity_all()` (exact through ALL resets
+    using the saltation matrix).  Input-time gradients via the TTFS IFT formula
+    (same as backward_layer_torch).
+
+    Same signature as backward_layer_torch + t_max + theta.  Returns (grad, lam_prev).
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    B = t_post.shape[1]
+    dev = W.device
+    dtype = W.dtype
+    grad = torch.zeros_like(W)
+    lam_prev = torch.zeros((n_in, B), dtype=dtype, device=dev)
+
+    fired = torch.isfinite(t_post)
+    if not fired.any():
+        return grad, lam_prev
+
+    # ResetLIF membrane: u(dt) = w * (exp(-dt/ts) - exp(-dt/tm)) / (1 - tm/ts)
+    #                       = w * ts * K_raw(dt)
+    # Grid engine:        u_grid(dt) = w * K_raw(dt) / k_peak
+    # So u_ResetLIF = ts * k_peak * u_grid, and the firing threshold
+    # must be theta * ts * k_peak to match the grid forward's u_grid >= theta.
+    lif = ResetLIF(tm=tm, ts=ts, theta=theta * ts * k_peak)
+
+    W_np = W.detach().cpu().numpy().astype(np.float64)
+    t_prev_np = t_prev.detach().cpu().numpy().astype(np.float64)
+    t_post_np = t_post.detach().cpu().numpy().astype(np.float64)
+    up_np = up.detach().cpu().numpy().astype(np.float64)
+    lam_np = lam_post.detach().cpu().numpy().astype(np.float64)
+
+    grad_np = np.zeros_like(W_np)
+    lam_prev_np = np.zeros((n_in, B), dtype=np.float64)
+
+    for j in range(n_cur):
+        for b in range(B):
+            lam_jb = lam_np[j, b]
+            if lam_jb == 0.0 or not np.isfinite(t_post_np[j, b]):
+                continue
+            up_jb = up_np[j, b]
+            if abs(up_jb) < 1e-12:
+                continue
+
+            inputs = []
+            for i in range(n_in):
+                t_val = float(t_prev_np[i, b]) if np.isfinite(t_prev_np[i, b]) else t_max
+                inputs.append((t_val, float(W_np[j, i])))
+            inputs.append((0.0, float(W_np[j, n_in])))
+
+            fires, dtdw_matrix = lif.sensitivity_all(inputs, t_end=t_max)
+            if not fires:
+                continue
+
+            dt_first_dW = np.array(dtdw_matrix[0])
+            grad_np[j, :] += lam_jb * dt_first_dW
+
+    for j in range(n_cur):
+        for b in range(B):
+            if lam_np[j, b] == 0.0 or not np.isfinite(t_post_np[j, b]):
+                continue
+            up_jb = up_np[j, b]
+            if abs(up_jb) < 1e-12:
+                continue
+            for i in range(n_in):
+                if not np.isfinite(t_prev_np[i, b]):
+                    continue
+                d = float(t_post_np[j, b] - t_prev_np[i, b])
+                if d <= 0:
+                    continue
+                if alpha:
+                    kd = (1.0 - d / tm) * math.exp(1.0 - d / tm) / (tm * k_peak)
+                else:
+                    kd = (-math.exp(-d / tm) / tm + math.exp(-d / ts) / ts) / (tm - ts) / k_peak
+                dt_dtin = W_np[j, i] * kd / up_jb
+                lam_prev_np[i, b] += lam_np[j, b] * dt_dtin
+
+    grad = torch.tensor(grad_np, dtype=dtype, device=dev)
+    lam_prev = torch.tensor(lam_prev_np, dtype=dtype, device=dev)
     return grad, lam_prev
 
 
@@ -448,10 +540,30 @@ class TTFSNetTorch:
         for l in reversed(range(self.n_layers)):
             t_prev, t_post, up = self._cache[l]
             g, lam = backward_layer_torch(self.W[l], t_prev, self.t_bias,
-                                          t_post, lam, up, self.tm, self.ts,
-                                          self._alpha, self.k_peak)
+                                           t_post, lam, up, self.tm, self.ts,
+                                           self._alpha, self.k_peak)
             grads[l] = g
         return grads
+
+    def backward_saltation(self, dL_dt_out):
+        """SP-03 saltation backward: exact weight gradients through resets."""
+        grads = [None] * self.n_layers
+        lam = dL_dt_out
+        for l in reversed(range(self.n_layers)):
+            t_prev, t_post, up = self._cache[l]
+            g, lam = backward_layer_saltation(
+                self.W[l], t_prev, self.t_bias, t_post, lam, up,
+                self.tm, self.ts, self._alpha, self.k_peak,
+                self.t_max, self.theta)
+            grads[l] = g
+        return grads
+
+    def loss_and_grads_saltation(self, t_in, y):
+        """Forward + latency CE + SP-03 saltation backward."""
+        t_out = self.forward(t_in)
+        loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
+        grads = self.backward_saltation(dL_dt_out)
+        return loss, grads, t_out
 
     def loss_and_grads(self, t_in, y):
         t_out = self.forward(t_in)
