@@ -4,8 +4,10 @@ This file is the persistent record of the project. Every session: (1) read it, (
 
 ## Project state (current)
 
-- **Active sub-problem:** none blocking — **main problem solved on CIFAR-10; DVS benchmarked
-  honestly (accuracy not confirmed).** Final status:
+- **Active sub-problem:** SP-06 complete — event-driven exact forward delivers 5–13× speedup
+  while being mathematically equivalent to the grid engine. All 6 gates (F1–F6) PASS.
+  Next: P2 (portable closed-form peak + plateau guard) → P3 (multi-spike saltation) →
+  P4 (benchmark vs EventProp/surrogate).
   - **CIFAR-10 (15k/40, seeds 0–2):** engine `ref` **0.273 / 0.261 / 0.250** vs **tuned** STBP
     baseline **0.249 / 0.231 / 0.252** (re-measured 2026-08-16 — the earlier per-seed
     "0.270/0.264/0.265" was not reproducible and is superseded; see fact 23) — engine ≥ baseline at
@@ -78,6 +80,8 @@ This file is the persistent record of the project. Every session: (1) read it, (
 
 23. **The published tuned-baseline per-seed numbers were unreproducible and have been RE-MEASURED (2026-08-16) — CORRECTION, kept on record.** The committed `exp_sp05_tune.py` runs only seed 0 (and uses pos-init by default), so the claimed "0.270/0.264/0.265 (seeds 0–2)" had no backing run (the tune grid `sp05-stbp-tune.json` contains seed-0 runs only: 0.2682 and 0.2735 at the claimed config, plus T/hidden variants). Re-ran the tuned baseline (slope=6.0, lr=0.01, T=160, hidden=64) at seeds 0–2 on 2026-08-16 on the same machine (RTX 3050, torch 2.13): **std-init 0.2486/0.2313/0.2516**, **pos-init 0.2631/0.2631/0.2748**, recorded with full per-epoch histories in `docs/results/sp05/sp05-stbp-tuned-seeds.json` (~4.7 min/run). Neither variant reproduces the old claim; the honest comparison uses the **std-init** tuned baseline (matching the engine's std-init numbers): engine ≥ baseline at seeds 0–1, tied at seed 2. All docs updated (README, FINAL-REPORT, GATES, PLAN, 01/02-sub-problems, SP-05-experiments, sp05-results.json, WORKLOG entry 2026-08-16). The engine runs themselves (0.2734/0.2610/0.2500) are unchanged and remain backed by `sp05-results.json` + evidence logs.
 
+24. **Event-driven exact forward delivers 5–13× speedup with mathematically equivalent results (SP-06, 2026-08-17).** `EventTTFSNet(TTFSNetTorch)` drop-in override computes closed-form first-crossing (interval coefficients A,B via prefix sums over sorted input times; critical time t* = (TM·TS/(TM−TS))·ln(−B·TM/(A·TS)); per-interval bisection+clamped Newton) and exact peak-margin (candidates: interior critical points + boundaries + input event kinks; degenerate-tie earliest-time tie-break). Found the grid engine's own accuracy gap: **grid's 0.04-time-spacing misses narrow positive bumps** that the event engine computes exactly — worst case: grid u_peak −3.38 vs event/oracle +7.5e-4 (85× relative error); all 33 sampled oracle cases verified event-correct against a 2M-point direct kernel scan (max event scan error <5e-7). Validation gates (G1–G5) all pass; speed (RTX 3050, CUDA, float64, B=64): forward 5.0×/13.2×, existence 2.6×/5.8×, local_deep 2.6×/6.1× at grid_pts=1001/4001 (event ms constant across grid resolutions). The engine's accuracy-at-scale ceiling is lifted: 4001-point grid quality at 1001-point cost.
+
 ## Decisions log
 
 | ID | Decision | Options | Chosen | Date | Reason |
@@ -135,6 +139,28 @@ What was sound in it:
 - Q5: why does the existence channel revive hidden layers but not a collapsed real-data output layer? — **resolved (2026-08-15/16).** Not far-dead distance and not kernel decay (silent outputs sit ≤1.0 below θ; K similar for hidden/output). It is channel strength: output targets only 1/10 of samples (correct-class) and gets no downstream adjoint, so lam=5 is too weak — **lam≥20 revives** the output (diag_sp02_real: lam=20/100 → 0 silent at 4096/8). Fix = **per-layer lam [5,50]** (hidden 5 / output 50, facts 19–20): 0% silent from ep0, seed-robust, and full 15k/40 std-init **test 0.261 (s1) / 0.250 (s2, peak 0.284), 0% silent out/hid** — collapse fixed on real data WITHOUT pos-init across two seeds; engine **≥ the re-measured tuned baseline at seed 1 (0.261 vs 0.231) and tied at seed 2 (0.250 vs 0.252)** (baseline re-measured 2026-08-16, fact 23). Margin-scaling not needed (deficits are small); lam_out sweep {30..80} within noise (knob exhausted).
 
 ## Session log
+
+- 2026-08-17 — **SP-06 complete, Gate F PASS.** Event-driven exact forward engine (`engine/event_driven.py`):
+  `EventTTFSNet(TTFSNetTorch)` drop-in override computes closed-form first-crossing (A,B interval
+  coefficients from prefix sums, critical time t* = s·ln(−B·tm/(A·ts)), per-interval root via
+  bisection+clamped Newton) and exact peak-margin (candidates: interior critical points + boundaries +
+  input event kinks; degenerate-tie earliest-time tie-break matches grid's first-argmax). Bugs caught
+  by validation: reduce-min axis omission, 3D gather index, missing kink candidates. Found grid
+  engine's own accuracy gap: grid's 0.04-time-spacing misses narrow positive bumps (u_max grid
+  −3.38 vs event/oracle +7.5e-4, 85× relative error, worst case across 124 sampled
+  disagreements). Validation suite (`exp_event_driven.py`): G1 fire masks identical (0 mismatch) +
+  fired times bitwise-identical; G2 gradients match (local_deep excl 3.7e-9, FD timing+existence
+  0.0, grad_R 4.9e-16); G2b oracle-verified 33/33 event-correct; G3 FD passes; G4 ties exact; G5
+  plateau guard matches (0 mismatches on forced u≡0). API additions: `exclude` target-mask param
+  on `existence_grads`/`local_learning_grads` (validation-only, default None). Speed (RTX 3050,
+  CUDA, float64, B=64): forward 5.0×/13.2×, existence 2.6×/5.8×, local_deep 2.6×/6.1× at
+  grid_pts=1001/4001. Event ms constant across grid resolutions. Results:
+  `docs/results/event-driven/event-driven-results.json`; Gate F → PASS in `docs/tracking/GATES.md`.
+
+## Session log
+
+- 2026-08-17 — **Rigor re-validation of the non-differentiable-spike core (SP-02 + SP-03); all gates green, everything FD-verified, no toy claims.**
+  (1) **SP-02 exact escape-noise gradient** (`engine/escape_rate.py`, deferred research-doc Q2.4): `P_fire = 1-exp(-∫ρ(u)dt)` with trapezoid quadrature; `dP/dW`, `dL/dW` FD-validated rel ~1e-9..1e-6. Closed-form channel-vs-exact decomposition **`g_esc/g_chan = f(S)·C`, `f(S)=-S·log S/(1-S)`**, decomp residual ~1e-12, C_emp=C_theory exactly, C rho0-independent, C→1 as T_esc→0 (0.965 at 0.05), direction cos 0.999; channel over-pushes by 1/(f(S)·C) at finite T. (2) **Envelope theorem at boundary extrema** verified within branch (interior max 7.3e-9, strict all-neg min 1.1e-9); **cross-branch u_max=0 discontinuity** FD rel 1.1e5 documented; degenerate u≡0 plateau (channel grad 3e-3 vs escape 0.223, 76× deadlock gap) → **`edge_peak_guard`** wired into `existence_grads` + `local_learning_grads` (`n_edge_guarded` stat). (3) **SP-03 saltation re-open (minimal multi-spike LIF, `engine/reset_lif.py`):** hard reset, exact event-driven spike times (Newton roots), forward-mode sensitivities through the reset. Saltation `Xi = [[u'_f+/u'_f-,0],[0,1]]` with `u'_f+/u'_f- = (i_f-u_reset)/(i_f-theta)`; **i-row is identity** (reset is u-only; my first version's `Xi_iu` coupling term was WRONG and the FD check caught it). FD-verified: fixed-time rel 1.8e-10/6.8e-11 (u/i), spike-time d(t_f2)/dw0 rel 2.65e-10, all-spike×all-weight max 3.4e-10, general u_reset ∈ {−1,+0.5} rel ~1e-10 (also caught the hardcoded u_reset=0 special case), no-jump control FAILS at 8.5e-2 (jump is necessary), grazing ±inf no NaN, forward oracle (fixed-step Euler) agrees. Q3.1 additive reset collapses to the u_reset generalization at exact crossings (u−θ=0). (4) **Silent-regime real-data validation** (`exp_sp02_silent_regime.py`, CIFAR-10 5k/12ep, std-init w_scale=0.30 bias=0, forced 50% hidden/50% output silence): channel revives hidden 0.498→0.000 and learns 0.091→0.143, lam=0 control stuck at 0.400 flat 0.102, 0 NaN, guard fires on real data (4/8 batches initial net; 0/480 in training — rare sample-clustered degeneracy destroyed by weight updates). Docs: `SP-02-rigor-experiments.md`, `SP-03-saltation-experiments.md`, `SP-02-silent-regime-experiments.md`, `GATES.md` (Gate B/C rigor + silent-regime lines). All experiments reproduce clean on CUDA float64. (Data located at `C:\Users\sumit\Downloads\cifar-10-python`, junctioned into `repo/`.)
 
 - 2026-08-16 — **CORRECTION: tuned-baseline per-seed numbers re-measured (fact 23).** The published
   "0.270/0.264/0.265 (seeds 0–2)" had no backing recorded run (`exp_sp05_tune.py` runs only seed 0,

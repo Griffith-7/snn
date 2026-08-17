@@ -1,0 +1,107 @@
+{
+  "S1_initial_silence": {
+    "output": 0.5000400043487548,
+    "hidden": 0.49815
+  },
+  "S_channel": {
+    "train_seconds": 536.4564201831818,
+    "history": [
+      {
+        "epoch": 0,
+        "test_acc": 0.0915
+      },
+      {
+        "epoch": 2,
+        "test_acc": 0.104
+      },
+      {
+        "epoch": 4,
+        "test_acc": 0.1005
+      },
+      {
+        "epoch": 6,
+        "test_acc": 0.11
+      },
+      {
+        "epoch": 8,
+        "test_acc": 0.1295
+      },
+      {
+        "epoch": 10,
+        "test_acc": 0.136
+      },
+      {
+        "epoch": 11,
+        "test_acc": 0.143
+      }
+    ],
+    "final_silent_output": 0.0,
+    "final_silent_hidden": 0.0,
+    "n_nan": 0,
+    "n_edge_guarded": 0
+  },
+  "S_control": {
+    "train_seconds": 517.0079004764557,
+    "history": [
+      {
+        "epoch": 0,
+        "test_acc": 0.1075
+      },
+      {
+        "epoch": 2,
+        "test_acc": 0.102
+      },
+      {
+        "epoch": 4,
+        "test_acc": 0.102
+      },
+      {
+        "epoch": 6,
+        "test_acc": 0.102
+      },
+      {
+        "epoch": 8,
+        "test_acc": 0.102
+      },
+      {
+        "epoch": 10,
+        "test_acc": 0.102
+      },
+      {
+        "epoch": 11,
+        "test_acc": 0.102
+      }
+    ],
+    "final_silent_output": 1.024,
+    "final_silent_hidden": 0.4,
+    "n_nan": 0,
+    "n_edge_guarded": 10
+  },
+  "S3b_plateau": {
+    "n_edge_guarded": 3,
+    "n_targeted": 0,
+    "grad_finite": true,
+    "loss": -1.000088900581841e-12
+  },
+  "S3b2_flippable": {
+    "n_edge_guarded": 3,
+    "n_targeted": 0
+  },
+  "S3b3_healthy_control": {
+    "n_edge_guarded": 0,
+    "n_targeted": 3
+  },
+  "S3c_guard_on_real_data": {
+    "batches": 8,
+    "n_edge_guarded": 4
+  },
+  "gates": {
+    "S1_silence_present": true,
+    "S2_no_nan": true,
+    "S5_learns": true,
+    "S4_revives": true,
+    "S6_control": true,
+    "S3_guard": true,
+    "S3c_real": true
+  }
+}

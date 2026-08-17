@@ -283,6 +283,52 @@ def peak_margin_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak):
     return t_peak, u_peak
 
 
+def edge_peak_guard(W, t_prev, t_bias, t_peak, u_peak, grid, w_cut=1e-9,
+                    edge_cells=1.5, u_cut=1e-6):
+    """SP-02 boundary-extremum guard. Returns (n_cur, B) mask: True => the
+    existence channel must NOT target this neuron.
+
+    The envelope theorem d(u_peak)/dW_ji = K(t_peak - t_in_i) is valid at
+    interior extrema (u'(t_peak) = 0) and at the fixed right endpoint t_max
+    (dt_peak/dW = 0). At the window start t_start it is ALSO valid whenever the
+    earliest contributing event's weight is stably nonzero: u(t_start) = 0
+    always (causal kernels K(0) = 0), so a max AT t_start has u_peak = 0 and
+    falls into the all-negative branch, which selects the interior MIN instead.
+
+    The single failure mode is the DEGENERATE pre-input plateau (u(t) = 0
+    identically, e.g. all-near-zero weights): u_peak = 0 at t_start, the
+    channel gradient is exactly 0 (deadlock), while the true escape-noise
+    gradient is nonzero (escape_rate.escape_grads revives such neurons); and if
+    the earliest event's weight sits at the |w| > 1e-12 contrib cutoff,
+    t_start itself moves with W and the envelope misses a u'(t_start)
+    dt_start/dW term. Both sub-cases are flagged here.
+    """
+    n_cur, n_inp = W.shape
+    n_in = n_inp - 1
+    B = t_prev.shape[1]
+    dev = W.device
+    dtype = W.dtype
+    inf = float("inf")
+    ev_times = torch.full((n_cur, B, n_in + 1), inf, dtype=dtype, device=dev)
+    if n_in:
+        ev_times[:, :, :n_in] = t_prev.t().unsqueeze(0)
+    ev_times[:, :, n_in] = t_bias
+    ev_w = torch.cat([W[:, :n_in], W[:, n_in].view(-1, 1)], dim=1).abs()
+    contrib = ev_w > 1e-12
+    masked = torch.where(contrib.unsqueeze(1), ev_times,
+                         torch.full_like(ev_times, inf))
+    t_start = masked.min(dim=2).values
+    t_start = torch.where(torch.isfinite(t_start), t_start,
+                          torch.zeros_like(t_start))
+    earliest_idx = masked.argmin(dim=2)             # (n_cur, B)
+    earliest_w = ev_w.gather(1, earliest_idx)       # (n_cur, B)
+    step = grid[1]
+    at_start = t_peak <= t_start + edge_cells * step
+    flat = (u_peak.abs() < u_cut) & at_start
+    flippable = (earliest_w <= w_cut) & at_start
+    return flat | flippable
+
+
 def _existence_layer_grads(W, g_l, t_peak_l, t_prev, t_bias, tm, ts, alpha, k_peak):
     """Weight grads + adjoint-into-prev of the SP-02 existence channel for one
     layer (extracted from existence_grads so the SP-04 local modes reuse it).
@@ -372,14 +418,25 @@ class TTFSNetTorch:
                 (rng.standard_normal((max(sizes[1:-1]), n_out)) * 0.5).astype(np.float64),
                 dtype=self.dtype, device=self.dev)
 
+    def _forward_layer(self, W, t_prev):
+        """Per-layer first-spike-time solve. Overridden by the event-driven
+        engine (engine/event_driven.py); this grid default is the verified one."""
+        return forward_layer_torch(W, t_prev, self.t_bias, self.theta,
+                                   self.grid, self.tm, self.ts, self._alpha,
+                                   self.k_peak, peak_tol=self.peak_tol)
+
+    def _peak_margin(self, W, t_prev):
+        """Per-layer extremum (t_peak, u_peak) for the existence channel.
+        Overridden by the event-driven engine."""
+        return peak_margin_torch(W, t_prev, self.t_bias, self.theta,
+                                 self.grid, self.tm, self.ts, self._alpha,
+                                 self.k_peak)
+
     def forward(self, t_in):
         t = t_in
         cache = []
         for l in range(self.n_layers):
-            t_post, up = forward_layer_torch(self.W[l], t, self.t_bias, self.theta,
-                                             self.grid, self.tm, self.ts,
-                                             self._alpha, self.k_peak,
-                                             peak_tol=self.peak_tol)
+            t_post, up = self._forward_layer(self.W[l], t)
             cache.append((t, t_post, up))
             t = t_post
         self._cache = cache
@@ -403,13 +460,21 @@ class TTFSNetTorch:
         return loss, grads, t_out
 
     def existence_grads(self, t_in, y, T_noise=1.0, lam=1.0,
-                        hidden_target=1.0, correct_output_target=True):
+                        hidden_target=1.0, correct_output_target=True,
+                        exclude=None):
         """Forward + SP-02 existence channel. Returns (loss_total, grads, stats).
 
         grads[l] is the TOTAL per-layer gradient: SP-01 exact timing gradient
         plus the existence-channel gradient for silent neurons (isolated by
         construction: fired neurons are never targeted, and (1-p) -> 0 as a
         revived neuron approaches p -> 1, so the channel auto-decays).
+
+        exclude: optional list of per-layer (n_cur, B) bool masks. Entries
+        where exclude[l] is True are removed from the existence targets before
+        computing loss/gradients -- used by validation to compare two engines
+        over an IDENTICAL target set (entries excluded are exactly those where
+        the reference engine's peak-margin pipeline is known to select a
+        different extremum).
 
         Existence objective (escape-noise peak-margin model, SP-02 research doc):
             L_exist = -(lam/B) * sum over targeted silent j of log p_j
@@ -439,14 +504,17 @@ class TTFSNetTorch:
             W = self.W[l]
             t_prev, t_post, up = self._cache[l]
             fired = torch.isfinite(t_post)
-            t_peak, u_peak = peak_margin_torch(W, t_prev, self.t_bias, self.theta,
-                                               self.grid, self.tm, self.ts,
-                                               self._alpha, self.k_peak)
+            t_peak, u_peak = self._peak_margin(W, t_prev)
             if l == n_layers - 1 and correct_output_target:
                 target = (~fired) & onehot
             else:
                 target = (~fired) * (hidden_target != 0.0)
             target = target.to(dtype)
+            guard = edge_peak_guard(W, t_prev, self.t_bias, t_peak, u_peak,
+                                    self.grid)
+            target = target * (~guard).to(dtype)
+            if exclude is not None:
+                target = target * (~exclude[l]).to(dtype)
             p = torch.sigmoid((u_peak - self.theta) / T_noise)
             loss_exist += (lam_l[l] / B) * float(
                 (-target * torch.log(p.clamp(min=1e-12))).sum())
@@ -455,6 +523,7 @@ class TTFSNetTorch:
             silent_stats.append({
                 "n_silent": int((~fired).sum().item()),
                 "n_targeted": int((target > 0).sum().item()),
+                "n_edge_guarded": int(guard.sum().item()),
             })
 
         loss_t, lam_timing = latency_cross_entropy(t_out, y, self.t_max, self.beta)
@@ -528,7 +597,7 @@ class TTFSNetTorch:
 
     def local_learning_grads(self, t_in, y, T_noise=1.0, lam=1.0, mode="deep",
                              hidden_target=1.0, correct_output_target=True,
-                             contrast_tau=1.0):
+                             contrast_tau=1.0, exclude=None):
         """SP-04: per-layer local learning signals + the SP-02 existence channel.
 
         Modes (see docs/research/SP-04-research.md Section 5/7):
@@ -575,14 +644,17 @@ class TTFSNetTorch:
             W = self.W[l]
             t_prev, t_post, up = self._cache[l]
             fired = torch.isfinite(t_post)
-            t_peak, u_peak = peak_margin_torch(W, t_prev, self.t_bias, self.theta,
-                                               self.grid, self.tm, self.ts,
-                                               self._alpha, self.k_peak)
+            t_peak, u_peak = self._peak_margin(W, t_prev)
             if l == n_layers - 1 and correct_output_target:
                 target = (~fired) & onehot
             else:
                 target = (~fired) * (hidden_target != 0.0)
             target = target.to(dtype)
+            guard = edge_peak_guard(W, t_prev, self.t_bias, t_peak, u_peak,
+                                    self.grid)
+            target = target * (~guard).to(dtype)
+            if exclude is not None:
+                target = target * (~exclude[l]).to(dtype)
             p = torch.sigmoid((u_peak - self.theta) / T_noise)
             loss_exist += (lam_l[l] / B) * float(
                 (-target * torch.log(p.clamp(min=1e-12))).sum())
@@ -591,6 +663,7 @@ class TTFSNetTorch:
             silent_stats.append({
                 "n_silent": int((~fired).sum().item()),
                 "n_targeted": int((target > 0).sum().item()),
+                "n_edge_guarded": int(guard.sum().item()),
             })
 
         loss_t, lam_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
