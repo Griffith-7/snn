@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "exact-snn"
+version = "1.0.0"
+description = "Exact-gradient training for Spiking Neural Networks — no surrogate approximations."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Sumith Kumar"},
+]
+keywords = ["snn", "spiking-neural-network", "exact-gradients", "implicit-function-theorem", "neuromorphic"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy",
+    "torch>=2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Griffith-7/snn"
+Repository = "https://github.com/Griffith-7/snn"
+
+[tool.setuptools.packages.find]
+include = ["exact_snn*"]

@@ -20,8 +20,8 @@ import math
 import numpy as np
 import torch
 
-from losses_torch import latency_cross_entropy, spike_count_cross_entropy, rate_latency_loss
-from reset_lif import ResetLIF
+from exact_snn.losses import latency_cross_entropy, spike_count_cross_entropy, rate_latency_loss
+from exact_snn.reset import ResetLIF
 
 
 _DEVICE = None
@@ -989,6 +989,13 @@ class TTFSNetTorch:
             W = self.W[l]
             t_prev, t_post, up = self._cache[l]
             fired = torch.isfinite(t_post)
+            n_cur_l = t_post.shape[0]
+            if fired.all():
+                g.append(torch.zeros((n_cur_l, B), dtype=dtype, device=dev))
+                peaks.append((t_post, up))
+                silent_stats.append({"n_silent": 0, "n_targeted": 0,
+                                     "n_edge_guarded": 0})
+                continue
             t_peak, u_peak = self._peak_margin(W, t_prev)
             if l == n_layers - 1 and correct_output_target:
                 target = (~fired) & onehot
@@ -1022,14 +1029,14 @@ class TTFSNetTorch:
             if lam_exist is not None:
                 lam_total = lam_total + lam_exist
             g_timing, lam_prev = backward_layer_torch(W, t_prev, self.t_bias,
-                                                      t_post, lam_total, up,
-                                                      self.tm, self.ts,
-                                                      self._alpha, self.k_peak)
+                                                       t_post, lam_total, up,
+                                                       self.tm, self.ts,
+                                                       self._alpha, self.k_peak)
             g_l = g[l]
-            t_peak_l, _ = peaks[l]
             g_exist = torch.zeros_like(W)
             targeted = g_l != 0
             if targeted.any():
+                t_peak_l, _ = peaks[l]
                 g_exist[:, n_in] = (g_l * _K(t_peak_l - self.t_bias, self.tm,
                                              self.ts, self._alpha,
                                              self.k_peak)).sum(dim=1)
@@ -1040,6 +1047,7 @@ class TTFSNetTorch:
             grads[l] = g_timing + g_exist
             lam_exist = torch.zeros((n_in, B), dtype=dtype, device=dev)
             if targeted.any():
+                t_peak_l, _ = peaks[l]
                 for i in range(n_in):
                     d = t_peak_l - t_prev[i].view(1, -1)
                     lam_exist[i] = (g_l * W[:, i].view(-1, 1)
@@ -1128,6 +1136,13 @@ class TTFSNetTorch:
             W = self.W[l]
             t_prev, t_post, up = self._cache[l]
             fired = torch.isfinite(t_post)
+            n_cur_l = t_post.shape[0]
+            if fired.all():
+                g.append(torch.zeros((n_cur_l, B), dtype=dtype, device=dev))
+                peaks.append((t_post, up))
+                silent_stats.append({"n_silent": 0, "n_targeted": 0,
+                                     "n_edge_guarded": 0})
+                continue
             t_peak, u_peak = self._peak_margin(W, t_prev)
             if l == n_layers - 1 and correct_output_target:
                 target = (~fired) & onehot

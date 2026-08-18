@@ -31,7 +31,7 @@ the grid engine (never used by the repo's experiments, tm=15, ts=4).
 """
 import torch
 
-from snn_torch import TTFSNetTorch, _du_at, _u_at
+from exact_snn.core import TTFSNetTorch, _du_at, _u_at
 
 N_BISECT = 20
 N_NEWTON = 8
