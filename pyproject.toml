@@ -27,6 +27,15 @@ dependencies = [
     "torch>=2.0",
 ]
 
+[project.optional-dependencies]
+train = [
+    "torchvision>=0.15",
+]
+dev = [
+    "pytest>=7.0",
+    "torchvision>=0.15",
+]
+
 [project.urls]
 Homepage = "https://github.com/Griffith-7/snn"
 Repository = "https://github.com/Griffith-7/snn"

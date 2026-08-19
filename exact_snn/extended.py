@@ -15,13 +15,37 @@ import math
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from exact_snn.core import (
     TTFSNetTorch,
     forward_layer_torch,
     backward_layer_torch,
+    peak_margin_torch,
+    edge_peak_guard,
+    _K,
+    _Kd,
 )
 from exact_snn.losses import latency_cross_entropy, spike_count_cross_entropy
+
+
+def xavier_init(w: torch.Tensor, fan_in: int, fan_out: int, seed: int) -> None:
+    """Xavier/Glorot uniform init for a weight tensor ``(fan_out, fan_in+1)``."""
+    limit = math.sqrt(6.0 / (fan_in + fan_out))
+    rng = np.random.default_rng(seed)
+    w_np = rng.uniform(-limit, limit, (fan_out, fan_in + 1)).astype(np.float64)
+    w_np[:, -1] = 0.1
+    w.copy_(torch.tensor(w_np, dtype=w.dtype, device=w.device))
+
+
+def kaiming_init(w: torch.Tensor, fan_in: int, fan_out: int, seed: int,
+                  leaky_relu_slope: float = 0.01) -> None:
+    """He/Kaiming init for a weight tensor ``(fan_out, fan_in+1)``."""
+    std = math.sqrt(2.0 / ((1 + leaky_relu_slope ** 2) * fan_in))
+    rng = np.random.default_rng(seed)
+    w_np = (rng.standard_normal((fan_out, fan_in + 1)) * std).astype(np.float64)
+    w_np[:, -1] = 0.1
+    w.copy_(torch.tensor(w_np, dtype=w.dtype, device=w.device))
 
 
 class SpikeNorm(torch.nn.Module):
@@ -259,6 +283,71 @@ class ConvTTFSLayer:
                 idx += 1
         return grad, lam_prev[:, p:p + H, p:p + W]
 
+    def existence_grads(self, g_exist: torch.Tensor, t_prev_batch: torch.Tensor,
+                        B: int, n_patches: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute existence-channel weight gradients for silent conv neurons.
+
+        Uses peak-margin analysis on the cached patches to find the maximum
+        membrane potential for each silent neuron, then applies the escape-noise
+        gradient.  Uses the envelope theorem: d(u_peak)/dW_ji = K(t_peak - t_in_i).
+
+        Args:
+            g_exist: (out_channels, B * n_patches) masked dL/d(u_peak) for
+                targeted silent neurons, zeros elsewhere.
+            t_prev_batch: (B, n_patches, in_channels * kh * kw + 1) cached patches
+                (needs to be reshaped from the flat cache).
+            B: batch size.
+            n_patches: number of spatial patches per sample.
+
+        Returns:
+            (g_exist_W, lam_exist) weight grads and adjoint into prev layer.
+        """
+        W = self.W
+        n_cur = self.out_channels
+        n_inp = W.shape[1]
+        n_in = n_inp - 1
+        targeted = g_exist != 0
+        g_exist_W = torch.zeros_like(W)
+
+        if not targeted.any():
+            return g_exist_W, None
+
+        patches = self._cached_patches
+        t_post = self._cached_t_post
+        up = self._cached_up
+        tm, ts = self.tm, self.ts
+        alpha = self._alpha
+        k_peak = self.k_peak
+        t_bias = 0.0
+
+        t_prev = patches[:-1]
+        t_peak, u_peak = peak_margin_torch(
+            W, t_prev, t_bias, self.theta, self.grid, tm, ts, alpha, k_peak)
+        guard = edge_peak_guard(W, t_prev, t_bias, t_peak, u_peak, self.grid)
+
+        g_masked = g_exist.clone()
+        g_masked[guard] = 0.0
+        g_masked[~targeted] = 0.0
+
+        if not g_masked.abs().any():
+            return g_exist_W, None
+
+        for j in range(n_in):
+            d = t_peak - patches[j].unsqueeze(0)
+            g_exist_W[:, j] = (g_masked * _K(d, tm, ts, alpha, k_peak)).sum(dim=1)
+        d_bias = t_peak - t_bias
+        g_exist_W[:, n_in] = (g_masked * _K(d_bias, tm, ts, alpha, k_peak)).sum(dim=1)
+
+        lam_exist = None
+        if n_in:
+            lam_exist = torch.zeros((n_in, B * n_patches), dtype=self.dtype, device=self.device)
+            for j in range(n_in):
+                d = t_peak - patches[j].unsqueeze(0)
+                lam_exist[j] = (g_masked * W[:, j].view(-1, 1)
+                                * _Kd(d, tm, ts, alpha, k_peak)).sum(dim=0)
+
+        return g_exist_W, lam_exist
+
 
 class SNNConvNet:
     """Convolutional SNN for image classification.
@@ -327,35 +416,33 @@ class SNNConvNet:
         self.fc_in = fc_in
 
     def _min_pool(self, t_feature_map, pool_size):
+        """Vectorized min-pool using F.unfold. Input: (C, H, W), Output: (C, H//ps, W//ps)."""
         C, H, W = t_feature_map.shape
-        H_out = H // pool_size
-        W_out = W // pool_size
-        t_pooled = torch.full((C, H_out, W_out), self.t_max,
-                              dtype=self.dtype, device=self.device)
-        self._pool_argmin = torch.zeros((C, H_out, W_out, 2), dtype=torch.long,
-                                        device=self.device)
-        for i in range(H_out):
-            for j in range(W_out):
-                region = t_feature_map[:, i * pool_size:(i + 1) * pool_size,
-                                         j * pool_size:(j + 1) * pool_size]
-                flat = region.reshape(C, -1)
-                mins = flat.min(dim=1)
-                t_pooled[:, i, j] = mins.values
-                argmins = mins.indices
-                self._pool_argmin[:, i, j, 0] = argmins // pool_size
-                self._pool_argmin[:, i, j, 1] = argmins % pool_size
-        return t_pooled
+        ps = pool_size
+        H_out, W_out = H // ps, W // ps
+        t_padded = t_feature_map[:, :H_out * ps, :W_out * ps]
+        patches = F.unfold(t_padded.unsqueeze(0), kernel_size=ps, stride=ps)  # (1, C*ps*ps, H_out*W_out)
+        patches = patches.squeeze(0).reshape(C, ps * ps, H_out * W_out)
+        mins, argmins = patches.min(dim=1)  # (C, H_out*W_out)
+        self._pool_argmin = argmins  # (C, H_out*W_out) values in [0, ps*ps)
+        return mins.reshape(C, H_out, W_out)
 
     def _min_pool_backward(self, lam_pooled, pool_size, C, H, W):
-        H_out = H // pool_size
-        W_out = W // pool_size
+        """Vectorized min-pool backward. lam_pooled: (C, H_out, W_out)."""
+        ps = pool_size
+        H_out, W_out = H // ps, W // ps
         lam_in = torch.zeros((C, H, W), dtype=self.dtype, device=self.device)
-        for i in range(H_out):
-            for j in range(W_out):
-                r = self._pool_argmin[:, i, j, 0]
-                c = self._pool_argmin[:, i, j, 1]
-                for ch in range(C):
-                    lam_in[ch, i * pool_size + r[ch], j * pool_size + c[ch]] += lam_pooled[ch, i, j]
+        argmin_flat = self._pool_argmin  # (C, H_out * W_out)
+        lam_flat = lam_pooled.reshape(C, H_out * W_out)
+        pos_h = argmin_flat // ps  # (C, H_out*W_out)
+        pos_w = argmin_flat % ps   # (C, H_out*W_out)
+        spatial_idx = torch.arange(H_out * W_out, device=self.device)
+        grid_i = spatial_idx // W_out  # (H_out*W_out,)
+        grid_j = spatial_idx % W_out
+        for k in range(H_out * W_out):
+            h_idx = grid_i[k] * ps + pos_h[:, k]
+            w_idx = grid_j[k] * ps + pos_w[:, k]
+            lam_in[:, h_idx, w_idx] += lam_flat[:, k]
         return lam_in
 
     def forward(self, t_images: torch.Tensor) -> torch.Tensor:
@@ -387,16 +474,20 @@ class SNNConvNet:
             self._fwd_cache['conv1'] = conv1_caches
 
             pool1_outs = []
-            pool1_shapes = []
+            pool1_argmins = []
             for b in range(B):
                 tp1 = self._min_pool(t_conv1[b], self.pool_size)
                 pool1_outs.append(tp1)
-                pool1_shapes.append((t_conv1[b].shape, self._pool_argmin.clone()))
+                pool1_argmins.append(self._pool_argmin.clone())
             t_pool1 = torch.stack(pool1_outs, dim=0)
-            self._fwd_cache['pool1'] = pool1_shapes
+            self._fwd_cache['pool1'] = pool1_argmins
 
             C1, h1, w1 = t_pool1.shape[1], t_pool1.shape[2], t_pool1.shape[3]
-            t_norm1 = t_pool1
+            n_feat1 = C1 * h1 * w1
+            self.norm1.train()
+            t_norm1_flat = t_pool1.permute(1, 2, 3, 0).reshape(n_feat1, B)
+            t_norm1_flat = self.norm1(t_norm1_flat)
+            t_norm1 = t_norm1_flat.reshape(C1, h1, w1, B).permute(3, 0, 1, 2)
             self._fwd_cache['norm1_in'] = t_pool1.reshape(B, C1, h1 * w1)
 
             conv2_outs = []
@@ -411,16 +502,20 @@ class SNNConvNet:
             self._fwd_cache['conv2'] = conv2_caches
 
             pool2_outs = []
-            pool2_shapes = []
+            pool2_argmins = []
             for b in range(B):
                 tp2 = self._min_pool(t_conv2[b], self.pool_size)
                 pool2_outs.append(tp2)
-                pool2_shapes.append((t_conv2[b].shape, self._pool_argmin.clone()))
+                pool2_argmins.append(self._pool_argmin.clone())
             t_pool2 = torch.stack(pool2_outs, dim=0)
-            self._fwd_cache['pool2'] = pool2_shapes
+            self._fwd_cache['pool2'] = pool2_argmins
 
             C2, h2, w2 = t_pool2.shape[1], t_pool2.shape[2], t_pool2.shape[3]
-            t_norm2 = t_pool2
+            n_feat2 = C2 * h2 * w2
+            self.norm2.train()
+            t_norm2_flat = t_pool2.permute(1, 2, 3, 0).reshape(n_feat2, B)
+            t_norm2_flat = self.norm2(t_norm2_flat)
+            t_norm2 = t_norm2_flat.reshape(C2, h2, w2, B).permute(3, 0, 1, 2)
             self._fwd_cache['norm2_in'] = t_pool2.reshape(B, C2, h2 * w2)
 
             t_flat = t_norm2.reshape(B, -1)
@@ -469,18 +564,26 @@ class SNNConvNet:
 
             grads_fc, lam_fc = self.fc.backward_with_input_grad(dL_dt)
 
+            T_noise = 1.0
+            lam_exist = 5.0
+
             grad_conv2_total = torch.zeros_like(self.conv2.W)
             grad_conv1_total = torch.zeros_like(self.conv1.W)
+            loss_exist = 0.0
+            n_targeted = [0, 0]
+            n_silent = [0, 0]
 
             for b in range(B):
                 lam_fc_b = lam_fc[:, b:b+1]
                 lam_norm2 = lam_fc_b.reshape(C2, h2 * w2)
 
-                conv2_shape, pool2_argmin = self._fwd_cache['pool2'][b]
+                conv2_shape = (C2, h2 * self.pool_size, w2 * self.pool_size)
+                pool2_argmin = self._fwd_cache['pool2'][b]
                 saved_pool_argmin = self._pool_argmin.clone()
                 self._pool_argmin = pool2_argmin
                 lam_conv2_b = self._min_pool_backward(lam_norm2.reshape(C2, h2, w2),
-                                                       self.pool_size, C2, conv2_shape[1], conv2_shape[2])
+                                                       self.pool_size, C2,
+                                                       conv2_shape[1], conv2_shape[2])
                 self._pool_argmin = saved_pool_argmin
 
                 patches2, t_post2, up2 = self._fwd_cache['conv2'][b]
@@ -489,6 +592,35 @@ class SNNConvNet:
                     lam_conv2_b.reshape(self.conv2.out_channels, -1), up2,
                     self.tm, self.ts, False, self.conv2.k_peak)
                 grad_conv2_total += g2
+
+                fired2 = torch.isfinite(t_post2)
+                if not fired2.all():
+                    silent2 = ~fired2
+                    n_silent[1] += int(silent2.sum().item())
+                    n_patches2 = patches2.shape[1]
+                    t_prev2 = patches2[:-1]
+                    t_peak2, u_peak2 = peak_margin_torch(
+                        self.conv2.W, t_prev2, 0.0, self.theta, self.conv2.grid,
+                        self.tm, self.ts, self.conv2._alpha, self.conv2.k_peak)
+                    guard2 = edge_peak_guard(
+                        self.conv2.W, t_prev2, 0.0, t_peak2, u_peak2, self.conv2.grid)
+                    target2 = (silent2.float() * (~guard2).float())
+                    n_targeted[1] += int(target2.sum().item())
+                    if target2.abs().any():
+                        p2 = torch.sigmoid((u_peak2 - self.theta) / T_noise)
+                        g_l2 = -(lam_exist / B) * target2 * (1.0 - p2) / T_noise
+                        loss_exist += (lam_exist / B) * float(
+                            (-target2 * torch.log(p2.clamp(min=1e-12))).sum())
+                        n_in2 = self.conv2.W.shape[1] - 1
+                        for j in range(n_in2):
+                            d2 = t_peak2 - patches2[j].unsqueeze(0)
+                            grad_conv2_total[:, j] += (
+                                g_l2 * _K(d2, self.tm, self.ts,
+                                          self.conv2._alpha, self.conv2.k_peak)).sum(dim=1)
+                        d_bias2 = t_peak2 - 0.0
+                        grad_conv2_total[:, n_in2] += (
+                            g_l2 * _K(d_bias2, self.tm, self.ts,
+                                      self.conv2._alpha, self.conv2.k_peak)).sum(dim=1)
 
                 C_in2 = self.conv2.in_channels
                 kh = self.conv2.kernel_size
@@ -507,11 +639,13 @@ class SNNConvNet:
                         idx2 += 1
                 lam_pool1_b = lam_folded[:, p:p+conv2_shape[1], p:p+conv2_shape[2]]
 
-                conv1_shape, pool1_argmin = self._fwd_cache['pool1'][b]
+                conv1_shape = (C1, h1 * self.pool_size, w1 * self.pool_size)
+                pool1_argmin = self._fwd_cache['pool1'][b]
                 saved_pool_argmin = self._pool_argmin.clone()
                 self._pool_argmin = pool1_argmin
                 lam_conv1_b = self._min_pool_backward(lam_pool1_b,
-                                                       self.pool_size, C1, conv1_shape[1], conv1_shape[2])
+                                                       self.pool_size, C1,
+                                                       conv1_shape[1], conv1_shape[2])
                 self._pool_argmin = saved_pool_argmin
 
                 patches1, t_post1, up1 = self._fwd_cache['conv1'][b]
@@ -521,10 +655,48 @@ class SNNConvNet:
                     self.tm, self.ts, False, self.conv1.k_peak)
                 grad_conv1_total += g1
 
+                fired1 = torch.isfinite(t_post1)
+                if not fired1.all():
+                    silent1 = ~fired1
+                    n_silent[0] += int(silent1.sum().item())
+                    n_patches1 = patches1.shape[1]
+                    t_prev1 = patches1[:-1]
+                    t_peak1, u_peak1 = peak_margin_torch(
+                        self.conv1.W, t_prev1, 0.0, self.theta, self.conv1.grid,
+                        self.tm, self.ts, self.conv1._alpha, self.conv1.k_peak)
+                    guard1 = edge_peak_guard(
+                        self.conv1.W, t_prev1, 0.0, t_peak1, u_peak1, self.conv1.grid)
+                    target1 = (silent1.float() * (~guard1).float())
+                    n_targeted[0] += int(target1.sum().item())
+                    if target1.abs().any():
+                        p1 = torch.sigmoid((u_peak1 - self.theta) / T_noise)
+                        g_l1 = -(lam_exist / B) * target1 * (1.0 - p1) / T_noise
+                        loss_exist += (lam_exist / B) * float(
+                            (-target1 * torch.log(p1.clamp(min=1e-12))).sum())
+                        n_in1 = self.conv1.W.shape[1] - 1
+                        for j in range(n_in1):
+                            d1 = t_peak1 - patches1[j].unsqueeze(0)
+                            grad_conv1_total[:, j] += (
+                                g_l1 * _K(d1, self.tm, self.ts,
+                                          self.conv1._alpha, self.conv1.k_peak)).sum(dim=1)
+                        d_bias1 = t_peak1 - 0.0
+                        grad_conv1_total[:, n_in1] += (
+                            g_l1 * _K(d_bias1, self.tm, self.ts,
+                                      self.conv1._alpha, self.conv1.k_peak)).sum(dim=1)
+
             grads = [grad_conv1_total, grad_conv2_total] + grads_fc
             grads_R = list(self.fc.R) if self.fc.R else None
 
-            return loss, grads, grads_R, {"loss_timing": float(loss), "t_out": t_out}
+            total_loss = float(loss) + loss_exist
+            stats = {
+                "loss_timing": float(loss),
+                "loss_exist": loss_exist,
+                "n_silent_conv": n_silent,
+                "n_targeted_conv": n_targeted,
+                "t_out": t_out,
+            }
+
+            return total_loss, grads, grads_R, stats
 
 
 class RecurrentTTFSLayer:
@@ -535,6 +707,12 @@ class RecurrentTTFSLayer:
       e_j(t) = exp(-dt/tau) * e_j(t-1) + delta(t - t_prev_j)
 
     This enables temporal memory without breaking the exact gradient framework.
+
+    NOTE: This uses a single-step recurrence model.  The trace is treated as
+    an additional input to the IFT layer, so the recurrent weight receives
+    correct gradients for a single time step.  True backpropagation through
+    time (BPTT) across multiple unrolled steps is not yet implemented —
+    gradients do not flow through the trace update rule itself.
     """
 
     def __init__(self, n_in: int, n_out: int, tm: float = 15.0, ts: float = 4.0,
@@ -690,9 +868,7 @@ class MultiSpikeNet:
         cache = getattr(self.base, '_cache_all', None)
         t_out_all = cache[-1] if cache is not None else t_out.unsqueeze(-1)
         loss, dL_dc = spike_count_cross_entropy(t_out_all, y)
-        dL_dt = torch.zeros_like(t_out)
-        for b in range(t_out.shape[1]):
-            dL_dt[:, b] = dL_dc[:, b] * (1.0 / (self.t_max + 1.0))
+        dL_dt = dL_dc * (1.0 / (self.t_max + 1.0))
         grads = self.base.backward_multispike(dL_dt)
         return loss, grads, t_out
 

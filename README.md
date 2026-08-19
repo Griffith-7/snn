@@ -23,6 +23,7 @@ Or from source:
 git clone https://github.com/Griffith-7/snn.git
 cd snn
 pip install -e .
+pip install -r requirements.txt   # for training scripts
 ```
 
 ## Quick Start
@@ -82,6 +83,33 @@ opt.step(params, [g if g is not None else torch.zeros_like(p)
                    for g, p in zip(grads + (grads_R or []), params)])
 ```
 
+## Training
+
+### MNIST (TTFS, fully-connected)
+
+```bash
+python train_mnist.py --epochs 10 --lr 0.005
+```
+
+This trains a 784-256-10 TTFS SNN on MNIST with exact IFT gradients. The
+input is latency-encoded (brighter pixels → earlier spikes). Output neuron
+with earliest spike wins.
+
+### Options
+
+```
+--arch 784-256-10        Network sizes (dash-separated)
+--epochs 10              Training epochs
+--batch-size 128         Mini-batch size
+--lr 0.005               Learning rate
+--clip 5.0               Gradient clipping
+--t-max 40.0             Max simulation time (ms)
+--tm 15.0                Membrane time constant
+--ts 4.0                 Synaptic time constant
+--device cuda            Device (auto/cuda/cpu)
+--max-samples 5000       Limit training set for quick tests
+```
+
 ## Architecture
 
 | Module | Description |
@@ -99,9 +127,13 @@ opt.step(params, [g if g is not None else torch.zeros_like(p)
 |---|---|
 | **Gradient accuracy** | cosine = 1.000000 vs finite-difference on all layer types |
 | **Event-driven speedup** | 2.89x faster than grid-scan engine |
-| **Transfer gap** | 6.5% (train vs test spike timing) |
 | **Conv SNN on CIFAR-10** | Loss drops 7.7 -> 2.6 in 1 epoch with exact gradients |
-| **Memory stable** | 13MB GPU memory during training (no leaks) |
+
+**Honest limitations:**
+- FC-only TTFS SNNs achieve ~10% accuracy on CIFAR-10 (random guessing) — spatial features require convolutional architecture
+- CIFAR-10 training to convergence (final accuracy) is ongoing work
+- The escape-noise temperature `T_noise` is a hyperparameter that may need tuning per task
+- No distributed/multi-GPU support yet
 
 ## The Math
 

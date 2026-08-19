@@ -31,7 +31,7 @@ Spiking neural networks (SNNs) offer energy-efficient computation by transmittin
 
 \section{Introduction}
 
-Spiking neural networks (SNNs) are a promising paradigm for energy-efficient deep learning because they process information through sparse binary events rather than dense continuous activations. Neuromorphic hardware such as Intel's Loihi~\citep{davies2018loihi}, IBM's TrueNorth~\citep{akopyan2015truenorth}, and BrainScaleS~\citep{penschuck2020brainscales} can execute SNNs with orders-of-magnitude lower power than GPUs for equivalent inference workloads. This hardware advantage has motivated a surge of interest in training SNNs with competitive accuracy on standard benchmarks~\citep{spikingjelly2021, nonoise2024, szyman2023}.
+Spiking neural networks (SNNs) are a promising paradigm for energy-efficient deep learning because they process information through sparse binary events rather than dense continuous activations. Neuromorphic hardware such as Intel's Loihi~\citep{davies2018loihi}, IBM's TrueNorth~\citep{akopyan2015truenorth}, and BrainScaleS~\citep{penschuck2020brainscales} can execute SNNs with orders-of-magnitude lower power than GPUs for equivalent inference workloads. This hardware advantage has motivated a surge of interest in training SNNs with competitive accuracy on standard benchmarks~\citep{spikingjelly2021, wunderlich2021eventprop, lee2023forwardprop}.
 
 The central difficulty in SNN training is that the spike generation mechanism is discontinuous. A Leaky Integrate-and-Fire (LIF) neuron emits a spike when its membrane potential crosses a threshold, after which the potential resets discontinuously. This reset creates a non-differentiable event: the spike timing $t_f$ depends on model parameters $\mathbf{w}$ through a transcendental condition that cannot be differentiated by the chain rule. Standard backpropagation is therefore inapplicable.
 
@@ -236,7 +236,7 @@ We evaluate Exact-SNN against six design criteria for practical SNN training:
 
 \textbf{Surrogate gradient methods.} The most widely used SNN training approach replaces the non-differentiable spike with a smooth surrogate in the backward pass. \textit{snnTorch}~\citep{spikingjelly2021} implements surrogate gradients with various shapes (sigmoid, triangle, Gaussian) in PyTorch. \textit{Norse}~\citep{plesser2021norse} provides a similar framework with functional programming idioms. \textit{SpykeTorch}~\citep{spikeconv2020} focuses on spatial-time convolutional SNNs. These libraries are mature and practical but inherit the gradient bias and training--inference gap inherent to surrogate methods.
 
-\textbf{Exact and quasi-exact methods.} \citet{szyman2023} propose exact-gradient computation through spike events, closely related to our IFT approach. \citet{nonoise2024} develop noise-aware exact gradients with similar saltation matrix techniques. Our contribution differs in the vectorized GPU implementation and the escape-noise mechanism for existence gradients, which we show is important for training convergence.
+\textbf{Exact and quasi-exact methods.} \citet{lee2023forwardprop} prove that SNNs have well-defined gradients w.r.t.\ weights via the IFT and propose a forward-propagation algorithm that computes exact gradients by exploiting causality between spike times. \citet{wunderlich2021eventprop} derive EventProp, an event-based backpropagation algorithm that computes exact gradients using the adjoint method with proper partial derivative jumps through spike discontinuities, achieving competitive results on Yin-Yang and MNIST. \citet{bauer2023exodus} develop EXODUS, which computes gradients equivalent to BPTT by applying IFT within SLAYER's framework, eliminating the need for ad-hoc gradient scaling. Our work shares the IFT foundation but differs in the vectorized GPU implementation that exploits closed-form inter-event analysis for acceleration, and the escape-noise mechanism for existence gradients which we show is important for training convergence.
 
 \textbf{Event-driven simulation.} Libraries like \textit{BindsNET}~\citep{dellanna2018bindsnets} and \textit{NEST}~\citep{gewaltig2007nest} support event-driven simulation but do not compute exact gradients. Our work integrates event-driven acceleration with exact backward passes, achieving both simulation and training efficiency.
 
@@ -340,16 +340,23 @@ S.~L. Shrestha and G.~Orchard.
 \newblock {SLAYER}: Spike layer error reassignment in time.
 \newblock {\em NeurIPS}, 2018.
 
-\bibitem[{Spiker}]{szyman2023}
-S.~Spiker.
-\newblock Exact gradient computation for spiking neural networks through
-  implicit differentiation.
-\newblock {\em arXiv preprint}, 2023.
+\bibitem[{Lee et~al.(2023)}]{lee2023forwardprop}
+J.~H. Lee, S.~Haghighatshoar, and A.~Karbasi.
+\newblock Exact gradient computation for spiking neural networks via
+  forward propagation.
+\newblock In {\em Proceedings of the 26th International Conference on
+  Artificial Intelligence and Statistics (AISTATS)}, PMLR 206:1812--1831, 2023.
 
-\bibitem[{Yin et~al.(2024)}]{nonoise2024}
-R.~Yin, S.~K. form Exact-SNN contributors, and others.
-\newblock Noise-aware exact gradients for spiking neural networks.
-\newblock {\em arXiv preprint}, 2024.
+\bibitem[{Wunderlich and {Pehle}(2021)}]{wunderlich2021eventprop}
+T.~Wunderlich and J.~Pehle.
+\newblock Event-based backpropagation can compute exact gradients for spiking
+  neural networks.
+\newblock {\em Scientific Reports}, 11:11075, 2021.
+
+\bibitem[{Bauer et~al.(2023)}]{bauer2023exodus}
+F.~C. Bauer, G.~Lenz, S.~Haghighatshoar, and S.~Sheik.
+\newblock {EXODUS}: Stable and efficient training of spiking neural networks.
+\newblock {\em Frontiers in Neuroscience}, 17:1110444, 2023.
 
 \end{thebibliography}
 

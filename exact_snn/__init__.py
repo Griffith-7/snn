@@ -43,6 +43,7 @@ from exact_snn.losses import (
     rate_latency_loss,
 )
 from exact_snn.optim import AdamTorch
+from exact_snn.extended import xavier_init, kaiming_init
 
 __all__ = [
     "TTFSNet",
@@ -63,4 +64,6 @@ __all__ = [
     "spike_count_cross_entropy",
     "rate_latency_loss",
     "AdamTorch",
+    "xavier_init",
+    "kaiming_init",
 ]

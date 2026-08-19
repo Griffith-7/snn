@@ -35,9 +35,8 @@ def spike_count_cross_entropy(t_spikes: torch.Tensor, y: torch.Tensor, beta: flo
     if t_spikes.dim() == 3:
         counts = torch.isfinite(t_spikes).float().sum(dim=2)
     else:
-        counts = (torch.isfinite(t_spikes)).float()
+        counts = torch.isfinite(t_spikes).float()
     B = t_spikes.shape[1]
-    counts = torch.isfinite(t_spikes).float().sum(dim=2) if t_spikes.dim() == 3 else torch.isfinite(t_spikes).float()
     counts = counts - counts.mean(dim=0, keepdim=True)
     logits = beta * counts
     logits = logits - logits.max(dim=0, keepdim=True).values

@@ -18,6 +18,9 @@ data/
 *.log
 !docs/results/evidence/*.log
 
+# Testing
+.pytest_cache/
+
 # OS / editor
 .DS_Store
 Thumbs.db
