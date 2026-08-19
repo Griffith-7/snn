@@ -16,6 +16,7 @@ The scalar NumPy engine (engine/snn.py) is kept as an independent oracle; the
 experiments cross-check this implementation against it (E1).
 """
 import math
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -59,7 +60,7 @@ def _u_at(W, t_in, t_bias, tm, ts, alpha, k_peak, t):
     n_in = W.shape[1] - 1
     u = W[:, n_in].view(-1, 1) * _K(t - t_bias, tm, ts, alpha, k_peak)
     if n_in:
-        D = t.unsqueeze(-1) - t_in.t().unsqueeze(0)  # (n_cur, B, n_in)
+        D = t.unsqueeze(-1) - t_in[:n_in].t().unsqueeze(0)  # (n_cur, B, n_in)
         u = u + (_K(D, tm, ts, alpha, k_peak) * W[:, :n_in].unsqueeze(1)).sum(-1)
     return u
 
@@ -68,13 +69,15 @@ def _du_at(W, t_in, t_bias, tm, ts, alpha, k_peak, t):
     n_in = W.shape[1] - 1
     du = W[:, n_in].view(-1, 1) * _Kd(t - t_bias, tm, ts, alpha, k_peak)
     if n_in:
-        D = t.unsqueeze(-1) - t_in.t().unsqueeze(0)
+        D = t.unsqueeze(-1) - t_in[:n_in].t().unsqueeze(0)
         du = du + (_Kd(D, tm, ts, alpha, k_peak) * W[:, :n_in].unsqueeze(1)).sum(-1)
     return du
 
 
-def forward_layer_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak,
-                        n_bisect=15, n_newton=8, peak_tol=1e-2):
+def forward_layer_torch(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                        theta: float, grid: torch.Tensor, tm: float, ts: float,
+                        alpha: bool, k_peak: float, n_bisect: int = 15,
+                        n_newton: int = 8, peak_tol: float = 1e-2) -> Tuple[torch.Tensor, torch.Tensor]:
     """W: (n_cur, n_in+1), t_prev: (n_in, B). Returns t_post (n_cur, B), du/dt at fire.
 
     peak_tol: the golden-section peak-refine (near-grazing branch) only runs for
@@ -90,10 +93,10 @@ def forward_layer_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak,
     G = grid.numel()
 
     g = grid.view(1, 1, -1)
-    U = torch.zeros((n_cur, B, G), dtype=dtype, device=dev)
-    for i in range(n_in):
-        d = g - t_prev[i].view(1, -1, 1)
-        U += W[:, i].view(n_cur, 1, 1) * _K(d, tm, ts, alpha, k_peak)
+    t_data = t_prev[:n_in]  # exclude bias row
+    D = g - t_data.unsqueeze(-1)  # (n_in, B, G)
+    K_vals = _K(D, tm, ts, alpha, k_peak)  # (n_in, B, G)
+    U = (W[:, :n_in] @ K_vals.reshape(n_in, -1)).reshape(n_cur, B, G)
     U += W[:, n_in].view(n_cur, 1, 1) * _K(g - t_bias, tm, ts, alpha, k_peak)
 
     mask = U >= theta
@@ -183,7 +186,10 @@ def forward_layer_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak,
     return t_post, up
 
 
-def backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up, tm, ts, alpha, k_peak):
+def backward_layer_torch(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                         t_post: torch.Tensor, lam_post: torch.Tensor,
+                         up: torch.Tensor, tm: float, ts: float,
+                         alpha: bool, k_peak: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """lam_post: (n_cur, B) = dL/dt_post. Returns grad (n_cur, n_in+1), lam_prev (n_in, B)."""
     n_cur, n_inp = W.shape
     n_in = n_inp - 1
@@ -202,16 +208,21 @@ def backward_layer_torch(W, t_prev, t_bias, t_post, lam_post, up, tm, ts, alpha,
     adj = torch.where(fired & (up != 0.0), la / up_safe, torch.zeros_like(la))
 
     grad[:, n_in] = -(adj * _K(t_post - t_bias, tm, ts, alpha, k_peak)).sum(dim=1)
-    for i in range(n_in):
-        d = t_post - t_prev[i].view(1, -1)
-        grad[:, i] = -(adj * _K(d, tm, ts, alpha, k_peak)).sum(dim=1)
-        lam_prev[i, :] = (adj * W[:, i].view(-1, 1) * _Kd(d, tm, ts, alpha, k_peak)).sum(dim=0)
+    t_data = t_prev[:n_in]  # exclude bias row, shape (n_in, B)
+    D_back = t_post.unsqueeze(-1) - t_data.T.unsqueeze(0)  # (n_cur, B, n_in)
+    K_back = _K(D_back, tm, ts, alpha, k_peak)  # (n_cur, B, n_in)
+    Kd_back = _Kd(D_back, tm, ts, alpha, k_peak)  # (n_cur, B, n_in)
+    grad[:, :n_in] = -(adj.unsqueeze(-1) * K_back).sum(dim=1)
+    lam_prev = (adj.unsqueeze(-1) * W[:, :n_in].unsqueeze(1) * Kd_back).sum(dim=0).T
     return grad, lam_prev
 
 
-def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
-                              alpha, k_peak, t_max, theta=1.0,
-                              t_all=None, up_all=None):
+def backward_layer_saltation(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                              t_post: torch.Tensor, lam_post: torch.Tensor,
+                              up: torch.Tensor, tm: float, ts: float,
+                              alpha: bool, k_peak: float, t_max: float,
+                              theta: float = 1.0, t_all: Optional[torch.Tensor] = None,
+                              up_all: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """SP-03 saltation backward with multi-spike support.
 
     When t_all/up_all are provided (from forward_multispike_layer), uses
@@ -225,8 +236,9 @@ def backward_layer_saltation(W, t_prev, t_bias, t_post, lam_post, up, tm, ts,
                                 tm, ts, alpha, k_peak)
 
 
-def forward_multispike_layer(W, t_prev, t_bias, tm, ts, theta, k_peak,
-                              t_max, max_spikes=20):
+def forward_multispike_layer(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                              tm: float, ts: float, theta: float, k_peak: float,
+                              t_max: float, max_spikes: int = 20) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Multi-spike forward using ResetLIF for every (neuron, sample).
 
     Simulates the full LIF+reset dynamics. Returns first-spike tensors
@@ -274,8 +286,11 @@ def forward_multispike_layer(W, t_prev, t_bias, tm, ts, theta, k_peak,
     return t_post, up, t_all, up_all
 
 
-def backward_multispike_layer(W, t_prev, t_bias, t_all, up_all, lam_post,
-                               tm, ts, k_peak, t_max, theta, fast_first=True):
+def backward_multispike_layer(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                               t_all: torch.Tensor, up_all: torch.Tensor,
+                               lam_post: torch.Tensor, tm: float, ts: float,
+                               k_peak: float, t_max: float, theta: float,
+                               fast_first: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
     """Multi-spike backward using ResetLIF sensitivity.
 
     Computes exact weight gradients through resets using the saltation
@@ -385,9 +400,11 @@ def _du_at_ms(W, t_prev, tm, ts, k_peak, t, t_f_prev, i_f_prev, unconsumed):
     return free + forced
 
 
-def forward_multispike_layer_torch(W, t_prev, t_bias, tm, ts, theta, k_peak,
-                                    t_max, grid, max_spikes=20,
-                                    n_bisect=15, n_newton=8):
+def forward_multispike_layer_torch(W: torch.Tensor, t_prev: torch.Tensor,
+                                    t_bias: float, tm: float, ts: float,
+                                    theta: float, k_peak: float, t_max: float,
+                                    grid: torch.Tensor, max_spikes: int = 20,
+                                    n_bisect: int = 15, n_newton: int = 8) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """GPU-vectorized multi-spike forward via grid iteration.
 
     After each spike the membrane is decomposed as
@@ -526,8 +543,11 @@ def forward_multispike_layer_torch(W, t_prev, t_bias, tm, ts, theta, k_peak,
     return t_post, up, t_all, up_all
 
 
-def backward_multispike_layer_torch(W, t_prev, t_bias, t_all, up_all,
-                                     lam_post, tm, ts, k_peak, t_max, theta):
+def backward_multispike_layer_torch(W: torch.Tensor, t_prev: torch.Tensor,
+                                     t_bias: float, t_all: torch.Tensor,
+                                     up_all: torch.Tensor, lam_post: torch.Tensor,
+                                     tm: float, ts: float, k_peak: float,
+                                     t_max: float, theta: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """GPU-vectorized multi-spike backward.
 
     First-spike gradients use the exact IFT formula (backward_layer_torch).
@@ -574,7 +594,9 @@ def backward_multispike_layer_torch(W, t_prev, t_bias, t_all, up_all,
     return grad, lam_prev
 
 
-def peak_margin_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak):
+def peak_margin_torch(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                      theta: float, grid: torch.Tensor, tm: float, ts: float,
+                      alpha: bool, k_peak: float) -> Tuple[torch.Tensor, torch.Tensor]:
     """Refined extremum (time, potential) per neuron over the RESPONSE window.
 
     The peak search is restricted to t >= t_start, where t_start is the time of
@@ -655,8 +677,10 @@ def peak_margin_torch(W, t_prev, t_bias, theta, grid, tm, ts, alpha, k_peak):
     return t_peak, u_peak
 
 
-def edge_peak_guard(W, t_prev, t_bias, t_peak, u_peak, grid, w_cut=1e-9,
-                    edge_cells=1.5, u_cut=1e-6):
+def edge_peak_guard(W: torch.Tensor, t_prev: torch.Tensor, t_bias: float,
+                    t_peak: torch.Tensor, u_peak: torch.Tensor, grid: torch.Tensor,
+                    w_cut: float = 1e-9, edge_cells: float = 1.5,
+                    u_cut: float = 1e-6) -> torch.Tensor:
     """SP-02 boundary-extremum guard. Returns (n_cur, B) mask: True => the
     existence channel must NOT target this neuron.
 
@@ -738,9 +762,14 @@ def _as_layer_lam(lam, n_layers):
 
 
 class TTFSNetTorch:
-    def __init__(self, sizes, tm=15.0, ts=4.0, theta=1.0, t_max=40.0,
-                 w_scale=0.2, bias_val=0.0, seed=0, grid_pts=4001,
-                 dtype=torch.float64, dev=None, peak_tol=1e-2, beta=1.0):
+    """Exact TTFS (Time-to-First-Spike) SNN with vectorized grid-scan forward and IFT backward."""
+
+    def __init__(self, sizes: List[int], tm: float = 15.0, ts: float = 4.0,
+                 theta: float = 1.0, t_max: float = 40.0, w_scale: float = 0.2,
+                 bias_val: float = 0.0, seed: int = 0, grid_pts: int = 4001,
+                 dtype: torch.dtype = torch.float64, dev: Optional[torch.device] = None,
+                 peak_tol: float = 1e-2, beta: float = 1.0,
+                 max_spikes: int = 1) -> None:
         self.sizes = list(sizes)
         self.n_layers = len(sizes) - 1
         self.tm = float(tm)
@@ -752,6 +781,7 @@ class TTFSNetTorch:
         self.dev = dev or device()
         self.dtype = dtype
         self.peak_tol = float(peak_tol)
+        self.max_spikes = int(max_spikes)
         if abs(self.tm - self.ts) < 1e-9:
             self._alpha = True
             self.k_peak = 1.0
@@ -809,17 +839,35 @@ class TTFSNetTorch:
         return edge_peak_guard(W, t_prev, self.t_bias, t_peak, u_peak,
                                self.grid)
 
-    def forward(self, t_in):
-        t = t_in
-        cache = []
-        for l in range(self.n_layers):
-            t_post, up = self._forward_layer(self.W[l], t)
-            cache.append((t, t_post, up))
-            t = t_post
-        self._cache = cache
-        return t
+    def forward(self, t_in: torch.Tensor) -> torch.Tensor:
+        """Forward pass: compute first-spike times through all layers.
 
-    def backward(self, dL_dt_out):
+        Args:
+            t_in: (n_in, B) input spike times.
+
+        Returns:
+            (n_out, B) output first-spike times (inf for silent neurons).
+        """
+        with torch.no_grad():
+            t = t_in
+            cache = []
+            for l in range(self.n_layers):
+                t_post, up = self._forward_layer(self.W[l], t)
+                cache.append((t, t_post, up))
+                t = t_post
+            self._cache = cache
+            return t
+
+    def backward(self, dL_dt_out: torch.Tensor) -> List[Optional[torch.Tensor]]:
+        """Backward pass: compute per-layer weight gradients via IFT.
+
+        Args:
+            dL_dt_out: (n_out, B) gradient of the loss w.r.t. output spike times.
+
+        Returns:
+            List of weight gradient tensors, one per layer, each of shape
+            (n_cur, n_in+1). None entries are replaced during accumulation.
+        """
         grads = [None] * self.n_layers
         lam = dL_dt_out
         for l in reversed(range(self.n_layers)):
@@ -830,7 +878,27 @@ class TTFSNetTorch:
             grads[l] = g
         return grads
 
-    def backward_saltation(self, dL_dt_out):
+    def backward_with_input_grad(self, dL_dt_out: torch.Tensor) -> Tuple[List[Optional[torch.Tensor]], torch.Tensor]:
+        """Like backward(), but also returns the gradient flowing to the input.
+
+        Args:
+            dL_dt_out: (n_out, B) gradient of the loss w.r.t. output spike times.
+
+        Returns:
+            Tuple of (grads, lam) where grads is the per-layer weight gradient
+            list and lam is (n_in, B) the adjoint into input spike times.
+        """
+        grads = [None] * self.n_layers
+        lam = dL_dt_out
+        for l in reversed(range(self.n_layers)):
+            t_prev, t_post, up = self._cache[l]
+            g, lam = backward_layer_torch(self.W[l], t_prev, self.t_bias,
+                                           t_post, lam, up, self.tm, self.ts,
+                                           self._alpha, self.k_peak)
+            grads[l] = g
+        return grads, lam
+
+    def backward_saltation(self, dL_dt_out: torch.Tensor) -> List[Optional[torch.Tensor]]:
         """SP-03 saltation backward: exact weight gradients through resets.
 
         Uses multi-spike cache (from forward_multispike) when available,
@@ -852,7 +920,7 @@ class TTFSNetTorch:
             grads[l] = g
         return grads
 
-    def loss_and_grads_saltation(self, t_in, y):
+    def loss_and_grads_saltation(self, t_in: torch.Tensor, y: torch.Tensor) -> Tuple[float, List[Optional[torch.Tensor]], torch.Tensor]:
         """Multi-spike forward + latency CE + saltation backward.
 
         Uses forward_multispike to populate the multi-spike cache,
@@ -864,7 +932,23 @@ class TTFSNetTorch:
         grads = self.backward_saltation(dL_dt_out)
         return loss, grads, t_out
 
-    def loss_and_grads(self, t_in, y):
+    def loss_and_grads(self, t_in: torch.Tensor, y: torch.Tensor) -> Tuple[float, List[Optional[torch.Tensor]], torch.Tensor]:
+        """Forward pass, compute loss, and return gradients.
+
+        Auto-dispatches to single-spike (max_spikes=1) or multi-spike
+        (max_spikes>1) pipelines.
+
+        Args:
+            t_in: (n_in, B) input spike times.
+            y: (B,) target class indices.
+
+        Returns:
+            Tuple of (loss, grads, t_out) where loss is a float, grads is the
+            per-layer weight gradient list, and t_out is (n_out, B) output
+            spike times.
+        """
+        if self.max_spikes > 1:
+            return self.loss_and_grads_saltation(t_in, y)
         t_out = self.forward(t_in)
         loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
         grads = self.backward(dL_dt_out)
@@ -913,14 +997,14 @@ class TTFSNetTorch:
             grads[l] = g
         return grads
 
-    def loss_and_grads_multispike(self, t_in, y):
+    def loss_and_grads_multispike(self, t_in: torch.Tensor, y: torch.Tensor) -> Tuple[float, List[Optional[torch.Tensor]], torch.Tensor]:
         """Forward (multi-spike) + latency CE + multi-spike backward."""
         t_out = self.forward_multispike(t_in)
         loss, dL_dt_out = latency_cross_entropy(t_out, y, self.t_max, self.beta)
         grads = self.backward_multispike(dL_dt_out)
         return loss, grads, t_out
 
-    def loss_and_grads_rate(self, t_in, y):
+    def loss_and_grads_rate(self, t_in: torch.Tensor, y: torch.Tensor) -> Tuple[float, List[Optional[torch.Tensor]], torch.Tensor]:
         """Multi-spike forward + spike-count CE + multi-spike backward.
 
         Uses rate-based classification: output with the most spikes wins.
@@ -935,7 +1019,7 @@ class TTFSNetTorch:
         grads = self.backward_multispike(dL_dt)
         return loss, grads, t_out
 
-    def loss_and_grads_rate_latency(self, t_in, y):
+    def loss_and_grads_rate_latency(self, t_in: torch.Tensor, y: torch.Tensor) -> Tuple[float, List[Optional[torch.Tensor]], torch.Tensor]:
         """Multi-spike forward + combined rate-latency loss + multi-spike backward."""
         t_out = self.forward_multispike(t_in)
         cache = getattr(self, '_cache_all', None)
@@ -944,9 +1028,10 @@ class TTFSNetTorch:
         grads = self.backward_multispike(dL_dt)
         return loss, grads, t_out
 
-    def existence_grads(self, t_in, y, T_noise=1.0, lam=1.0,
-                        hidden_target=1.0, correct_output_target=True,
-                        exclude=None):
+    def existence_grads(self, t_in: torch.Tensor, y: torch.Tensor, T_noise: float = 1.0,
+                        lam: float = 1.0, hidden_target: float = 1.0,
+                        correct_output_target: bool = True,
+                        exclude: Optional[List[Optional[torch.Tensor]]] = None) -> Tuple[float, List[Optional[torch.Tensor]], dict]:
         """Forward + SP-02 existence channel. Returns (loss_total, grads, stats).
 
         grads[l] is the TOTAL per-layer gradient: SP-01 exact timing gradient
@@ -1087,9 +1172,11 @@ class TTFSNetTorch:
         dLdz = c @ M.t()                          # (n_cur, B)
         return torch.where(fired, dLdz, torch.zeros_like(dLdz))
 
-    def local_learning_grads(self, t_in, y, T_noise=1.0, lam=1.0, mode="deep",
-                             hidden_target=1.0, correct_output_target=True,
-                             contrast_tau=1.0, exclude=None):
+    def local_learning_grads(self, t_in: torch.Tensor, y: torch.Tensor,
+                             T_noise: float = 1.0, lam: float = 1.0, mode: str = "deep",
+                             hidden_target: float = 1.0, correct_output_target: bool = True,
+                             contrast_tau: float = 1.0,
+                             exclude: Optional[List[Optional[torch.Tensor]]] = None) -> Tuple[float, List[Optional[torch.Tensor]], Optional[List[Optional[torch.Tensor]]], dict]:
         """SP-04: per-layer local learning signals + the SP-02 existence channel.
 
         Modes (see docs/research/SP-04-research.md Section 5/7):

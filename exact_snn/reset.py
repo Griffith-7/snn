@@ -37,6 +37,8 @@ Verified by exp_sp03_saltation.py and exp_sp03_multispike.py against central
 finite differences: fixed-time sensitivity ~1e-10, spike-time sensitivity
 < 1e-4, general u_reset ~1e-10, grazing documented (no NaN).
 """
+from __future__ import annotations
+
 import math
 
 
@@ -48,8 +50,19 @@ except ImportError:
 
 
 class ResetLIF:
-    def __init__(self, tm=15.0, ts=4.0, theta=1.0, u_rest=0.0, u_reset=0.0,
-                 dt_scan=0.05):
+    def __init__(self, tm: float = 15.0, ts: float = 4.0, theta: float = 1.0,
+                 u_rest: float = 0.0, u_reset: float = 0.0,
+                 dt_scan: float = 0.05) -> None:
+        """Initialise LIF neuron parameters.
+
+        Args:
+            tm: Membrane time constant.
+            ts: Synaptic time constant.
+            theta: Spike threshold.
+            u_rest: Resting membrane potential.
+            u_reset: Reset membrane potential after a spike.
+            dt_scan: Coarse scan step for bracketing threshold crossings.
+        """
         self.tm = float(tm)
         self.ts = float(ts)
         self.theta = float(theta)
@@ -110,7 +123,7 @@ class ResetLIF:
         return None
 
     # ---- forward --------------------------------------------------------
-    def run(self, inputs, t_end=200.0):
+    def run(self, inputs: list[tuple[float, float]], t_end: float = 200.0) -> list[float]:
         """inputs: iterable of (t, w). Returns the list of fire times."""
         evs = sorted((float(t), float(w)) for (t, w) in inputs)
         fires = []
@@ -134,7 +147,7 @@ class ResetLIF:
         return fires
 
     # ---- forward-mode sensitivity (with saltation at each reset) --------
-    def sensitivity(self, inputs, w_idx, t_end=200.0):
+    def sensitivity(self, inputs: list[tuple[float, float]], w_idx: int, t_end: float = 200.0) -> tuple[list[float], list[float]]:
         """d(spike_time)/d(w_{w_idx}) for every spike, via the saltation.
 
         Returns (fires, dtdw). The variational (s_u, s_i) is propagated by the
@@ -185,7 +198,7 @@ class ResetLIF:
             t = tk
         return fires, dtdw
 
-    def run_with_state(self, inputs, t_end=200.0):
+    def run_with_state(self, inputs: list[tuple[float, float]], t_end: float = 200.0) -> tuple[list[float], list[float]]:
         """Forward that also returns du/dt at each spike.
 
         Returns (fires, up_at_fires).  Each entry in up_at_fires is the
@@ -215,7 +228,7 @@ class ResetLIF:
         return fires, ups
 
     # ---- ALL-weight sensitivity (vectorised over weights) ----------------
-    def sensitivity_all(self, inputs, t_end=200.0):
+    def sensitivity_all(self, inputs: list[tuple[float, float]], t_end: float = 200.0) -> tuple[list[float], list[list[float]]]:
         """d(spike_k)/d(w_m) for ALL weights m in a single pass.
 
         Returns (fires, dtdw_matrix) where dtdw_matrix[k][m] is the
@@ -282,7 +295,7 @@ class ResetLIF:
         return fires, dtdw_matrix
 
     # ---- first-spike only (vectorised, early exit) ----------------------
-    def sensitivity_first_spike(self, inputs, t_end=200.0):
+    def sensitivity_first_spike(self, inputs: list[tuple[float, float]], t_end: float = 200.0) -> tuple[float | None, _np.ndarray]:
         """d(first_spike)/d(w_m) for ALL weights — numpy-vectorized, early exit.
 
         Returns (fire_time, dtdw_array) or (None, zeros) if no spike.
@@ -331,7 +344,7 @@ class ResetLIF:
         return None, _np.zeros(n_w, dtype=_np.float64)
 
     # ---- fixed-time state + sensitivity ---------------------------------
-    def state_at(self, inputs, t_eval, w_idx=0, use_saltation=True, t_end=200.0):
+    def state_at(self, inputs: list[tuple[float, float]], t_eval: float, w_idx: int = 0, use_saltation: bool = True, t_end: float = 200.0) -> tuple[float, float, float, float]:
         """(u, i, s_u, s_i) at a fixed time t_eval (no crossing at t_eval),
         with the saltation applied at resets -- used for the fixed-time FD
         check of the jump map. With use_saltation=False the variationals are

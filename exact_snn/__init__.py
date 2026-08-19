@@ -16,7 +16,7 @@ Extended architectures:
     from exact_snn.extended import ConvTTFSLayer, SNNConvNet, MultiSpikeNet
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __author__ = "Sumith Kumar"
 
 from exact_snn.core import (
@@ -27,28 +27,21 @@ from exact_snn.core import (
     peak_margin_torch,
     edge_peak_guard,
     device,
-    _K,
-    _Kd,
-)
-
-TTFSNet = TTFSNetTorch
-
-from exact_snn.event import EventTTFSNet
-
-from exact_snn.reset import ResetLIF
-from exact_snn.core import (
     forward_multispike_layer,
     forward_multispike_layer_torch,
     backward_multispike_layer,
     backward_multispike_layer_torch,
 )
 
+TTFSNet = TTFSNetTorch
+
+from exact_snn.event import EventTTFSNet
+from exact_snn.reset import ResetLIF
 from exact_snn.losses import (
     latency_cross_entropy,
     spike_count_cross_entropy,
     rate_latency_loss,
 )
-
 from exact_snn.optim import AdamTorch
 
 __all__ = [

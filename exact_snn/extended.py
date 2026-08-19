@@ -17,9 +17,9 @@ import numpy as np
 import torch
 
 from exact_snn.core import (
-    TTFSNetTorch, _K, _Kd, _u_at, _du_at,
-    forward_layer_torch, backward_layer_torch,
-    peak_margin_torch, edge_peak_guard, _as_layer_lam,
+    TTFSNetTorch,
+    forward_layer_torch,
+    backward_layer_torch,
 )
 from exact_snn.losses import latency_cross_entropy, spike_count_cross_entropy
 
@@ -32,7 +32,14 @@ class SpikeNorm(torch.nn.Module):
       t_out = gamma * t_norm + beta
     """
 
-    def __init__(self, n_features, momentum=0.1, eps=1e-5):
+    def __init__(self, n_features: int, momentum: float = 0.1, eps: float = 1e-5) -> None:
+        """Initialise learnable scale/shift and running statistics.
+
+        Args:
+            n_features: Number of feature channels to normalise.
+            momentum: Exponential moving average factor for running stats.
+            eps: Small constant added to variance for numerical stability.
+        """
         super().__init__()
         self.eps = eps
         self.momentum = momentum
@@ -41,7 +48,15 @@ class SpikeNorm(torch.nn.Module):
         self.register_buffer('running_mean', torch.zeros(n_features))
         self.register_buffer('running_var', torch.ones(n_features))
 
-    def forward(self, t):
+    def forward(self, t: torch.Tensor) -> torch.Tensor:
+        """Normalize spike times across the batch dimension.
+
+        Args:
+            t: Spike times of shape ``(n_features, B)``.
+
+        Returns:
+            Normalized spike times of the same shape.
+        """
         if self.training:
             mean = t.mean(dim=1)
             var = t.var(dim=1, unbiased=False)
@@ -65,9 +80,31 @@ class ConvTTFSLayer:
     All gradient computation uses the exact IFT formulas from the base engine.
     """
 
-    def __init__(self, in_channels, out_channels, kernel_size, stride, padding,
-                 tm=15.0, ts=4.0, theta=1.0, t_max=40.0,
-                 grid_pts=501, dtype=torch.float64, device=None, seed=0):
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
+                 stride: int, padding: int, tm: float = 15.0, ts: float = 4.0,
+                 theta: float = 1.0, t_max: float = 40.0, grid_pts: int = 501,
+                 dtype: torch.dtype = torch.float64,
+                 device: torch.device | None = None, seed: int = 0,
+                 n_bisect: int = 8, n_newton: int = 5) -> None:
+        """Initialise a convolutional TTFS layer.
+
+        Args:
+            in_channels: Number of input channels.
+            out_channels: Number of output channels (filters).
+            kernel_size: Spatial size of each filter (square).
+            stride: Stride of the convolution.
+            padding: Zero-padding added to both sides of the input.
+            tm: Membrane time constant.
+            ts: Synaptic time constant.
+            theta: Firing threshold.
+            t_max: Maximum spike time (response window).
+            grid_pts: Number of grid points for the lookup table.
+            dtype: Floating-point dtype for parameters.
+            device: Target device.
+            seed: Random seed for weight initialisation.
+            n_bisect: Number of bisection refinement steps.
+            n_newton: Number of Newton refinement steps.
+        """
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
@@ -92,16 +129,38 @@ class ConvTTFSLayer:
         w[:, -1] = 0.2
         self.W = torch.nn.Parameter(torch.tensor(w, dtype=dtype, device=self.device))
 
+        self.n_bisect = n_bisect
+        self.n_newton = n_newton
         self._cached_patches = None
         self._cached_t_post = None
         self._cached_up = None
 
-    def output_size(self, h_in, w_in):
+    def output_size(self, h_in: int, w_in: int) -> tuple[int, int]:
+        """Compute output spatial dimensions.
+
+        Args:
+            h_in: Input height.
+            w_in: Input width.
+
+        Returns:
+            ``(h_out, w_out)`` spatial dimensions after convolution.
+        """
         h_out = (h_in + 2 * self.padding - self.kernel_size) // self.stride + 1
         w_out = (w_in + 2 * self.padding - self.kernel_size) // self.stride + 1
         return h_out, w_out
 
-    def unfold_input(self, t_in):
+    def unfold_input(self, t_in: torch.Tensor) -> torch.Tensor:
+        """Unfold a single-sample spike-time map into column patches.
+
+        Pads the input with ``t_max`` (no spike), extracts all ``kernel_size x
+        kernel_size`` patches at the given stride, and appends a bias column.
+
+        Args:
+            t_in: Spike times of shape ``(C, H, W)``.
+
+        Returns:
+            Patch matrix of shape ``(C*kh*kw + 1, n_patches)``.
+        """
         C, H, W = t_in.shape
         kh, kw = self.kernel_size, self.kernel_size
         s = self.stride
@@ -122,23 +181,59 @@ class ConvTTFSLayer:
         bias_col = torch.zeros(1, t_patches.shape[1], dtype=self.dtype, device=self.device)
         return torch.cat([t_patches, bias_col], dim=0)
 
-    def fold_output(self, t_post, H_out, W_out):
+    def fold_output(self, t_post: torch.Tensor, H_out: int, W_out: int) -> torch.Tensor:
+        """Reshape a flat output spike vector back to spatial feature-map layout.
+
+        Args:
+            t_post: Spike times of shape ``(out_channels, n_patches)``.
+            H_out: Output height.
+            W_out: Output width.
+
+        Returns:
+            Tensor of shape ``(out_channels, H_out, W_out)``.
+        """
         return t_post.reshape(self.out_channels, H_out, W_out)
 
-    def forward(self, t_in):
-        H_out, W_out = self.output_size(t_in.shape[1], t_in.shape[2])
-        t_patches = self.unfold_input(t_in)
-        t_post, up = forward_layer_torch(
-            self.W, t_patches, 0.0, self.theta, self.grid,
-            self.tm, self.ts, False, self.k_peak)
-        self._cached_patches = t_patches
-        self._cached_t_post = t_post
-        self._cached_up = up
-        self._cached_H_out = H_out
-        self._cached_W_out = W_out
-        return self.fold_output(t_post, H_out, W_out)
+    def forward(self, t_in: torch.Tensor) -> torch.Tensor:
+        """Forward pass: unfold input, solve TTFS, fold output.
 
-    def backward(self, t_in, lam_post):
+        Caches intermediate results (patches, t_post, up) for the subsequent
+        backward pass.
+
+        Args:
+            t_in: Spike times of shape ``(C, H, W)``.
+
+        Returns:
+            Output spike times of shape ``(out_channels, H_out, W_out)``.
+        """
+        with torch.no_grad():
+            H_out, W_out = self.output_size(t_in.shape[1], t_in.shape[2])
+            t_patches = self.unfold_input(t_in)
+            t_post, up = forward_layer_torch(
+                self.W, t_patches, 0.0, self.theta, self.grid,
+                self.tm, self.ts, False, self.k_peak,
+                n_bisect=self.n_bisect, n_newton=self.n_newton)
+            self._cached_patches = t_patches
+            self._cached_t_post = t_post
+            self._cached_up = up
+            self._cached_H_out = H_out
+            self._cached_W_out = W_out
+            return self.fold_output(t_post, H_out, W_out)
+
+    def backward(self, t_in: torch.Tensor, lam_post: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Backward pass: compute weight gradients and propagate lambdas.
+
+        Uses cached forward results (patches, t_post, up) to compute exact IFT
+        gradients and fold lambda back to the input spatial layout.
+
+        Args:
+            t_in: Original input spike times ``(C, H, W)``.
+            lam_post: Post-synaptic lambdas ``(out_channels, H_out, W_out)``.
+
+        Returns:
+            ``(grad_W, lam_prev)`` where *grad_W* is the weight gradient tensor
+            and *lam_prev* has shape ``(C, H, W)``.
+        """
         H_out = self._cached_H_out
         W_out = self._cached_W_out
         t_patches = self._cached_patches
@@ -168,17 +263,36 @@ class ConvTTFSLayer:
 class SNNConvNet:
     """Convolutional SNN for image classification.
 
-    Architecture: Conv(C->16, 3x3, pad=1) -> Pool(2x2) -> SpikeNorm ->
-                  Conv(16->32, 3x3, pad=1) -> Pool(2x2) -> SpikeNorm ->
+    Architecture: Conv(C->16, 3x3, pad=1) -> MinPool(2x2) -> SpikeNorm ->
+                  Conv(16->32, 3x3, pad=1) -> MinPool(2x2) -> SpikeNorm ->
                   Flatten -> FC(32*H*W -> 64 -> 10)
 
-    Uses TTFS encoding, exact IFT gradients, SpikeNorm for deep training.
+    Uses TTFS encoding, exact IFT gradients, SpikeNorm for training stability.
     All gradients are exact via the IFT formulas — no surrogate approximation.
     """
 
-    def __init__(self, in_channels=3, h_w=32, n_classes=10, tm=15.0, ts=4.0,
-                 theta=1.0, t_max=40.0, grid_pts=501, dtype=torch.float64,
-                 device=None, seed=0, beta=1.0):
+    def __init__(self, in_channels: int = 3, h_w: int = 32, n_classes: int = 10,
+                 tm: float = 15.0, ts: float = 4.0, theta: float = 1.0,
+                 t_max: float = 40.0, grid_pts: int = 301,
+                 dtype: torch.dtype = torch.float32,
+                 device: torch.device | None = None, seed: int = 0,
+                 beta: float = 1.0) -> None:
+        """Build the two-layer convolutional SNN.
+
+        Args:
+            in_channels: Number of input channels (e.g. 3 for RGB).
+            h_w: Spatial height/width of square input images.
+            n_classes: Number of output classes.
+            tm: Membrane time constant.
+            ts: Synaptic time constant.
+            theta: Firing threshold.
+            t_max: Maximum spike time (response window).
+            grid_pts: Number of grid points for the lookup table.
+            dtype: Floating-point dtype.
+            device: Target device.
+            seed: Random seed for weight initialisation.
+            beta: Existence-channel strength scaling factor.
+        """
         self.tm = tm
         self.ts = ts
         self.theta = theta
@@ -208,162 +322,213 @@ class SNNConvNet:
         self.fc = TTFSNetTorch([fc_in, 64, n_classes], tm=tm, ts=ts, theta=theta,
                                t_max=t_max, w_scale=0.2, bias_val=0.2, seed=seed,
                                grid_pts=grid_pts, dtype=dtype, dev=self.device, beta=beta)
-        self._cached_inputs = []
-        self._cached_pools = []
-        self._cached_norms = []
+        self.h1 = h1
+        self.h2 = h2
+        self.fc_in = fc_in
 
-    def _avg_pool(self, t_feature_map, pool_size):
+    def _min_pool(self, t_feature_map, pool_size):
         C, H, W = t_feature_map.shape
         H_out = H // pool_size
         W_out = W // pool_size
         t_pooled = torch.full((C, H_out, W_out), self.t_max,
                               dtype=self.dtype, device=self.device)
+        self._pool_argmin = torch.zeros((C, H_out, W_out, 2), dtype=torch.long,
+                                        device=self.device)
         for i in range(H_out):
             for j in range(W_out):
                 region = t_feature_map[:, i * pool_size:(i + 1) * pool_size,
                                          j * pool_size:(j + 1) * pool_size]
-                t_pooled[:, i, j] = region.reshape(C, -1).min(dim=1).values
+                flat = region.reshape(C, -1)
+                mins = flat.min(dim=1)
+                t_pooled[:, i, j] = mins.values
+                argmins = mins.indices
+                self._pool_argmin[:, i, j, 0] = argmins // pool_size
+                self._pool_argmin[:, i, j, 1] = argmins % pool_size
         return t_pooled
 
-    def forward(self, t_in_raw):
-        B, C, H, W = t_in_raw.shape
-        t_max = self.t_max
+    def _min_pool_backward(self, lam_pooled, pool_size, C, H, W):
+        H_out = H // pool_size
+        W_out = W // pool_size
+        lam_in = torch.zeros((C, H, W), dtype=self.dtype, device=self.device)
+        for i in range(H_out):
+            for j in range(W_out):
+                r = self._pool_argmin[:, i, j, 0]
+                c = self._pool_argmin[:, i, j, 1]
+                for ch in range(C):
+                    lam_in[ch, i * pool_size + r[ch], j * pool_size + c[ch]] += lam_pooled[ch, i, j]
+        return lam_in
 
-        if t_in_raw.shape[1:] != (C, H, W) or t_in_raw.min() < -0.1:
-            t_encoded = 0.5 + 7.5 * (1.0 - t_in_raw.clamp(0, 1))
-        else:
-            t_encoded = t_in_raw
+    def forward(self, t_images: torch.Tensor) -> torch.Tensor:
+        """Full forward pass through conv layers, pooling, norms, and FC.
 
-        self._cached_inputs = []
-        self._cached_pools = []
+        Args:
+            t_images: Batch of images as spike times ``(B, C, H, W)`` with
+                values in ``(0, 1)`` (intensity).
 
-        t_batch = t_encoded
-        self._cached_inputs.append(t_batch)
-
-        t_conv1_batch = []
-        for b in range(B):
-            tc1 = self.conv1.forward(t_batch[b])
-            self.conv1._cached_patches = None
-            self.conv1._cached_t_post = None
-            self.conv1._cached_up = None
-            t_conv1_batch.append(tc1)
-        t_conv1 = torch.stack(t_conv1_batch, dim=0)
-
-        t_pool1_batch = []
-        for b in range(B):
-            tp1 = self._avg_pool(t_conv1[b], self.pool_size)
-            t_pool1_batch.append(tp1)
-        t_pool1 = torch.stack(t_pool1_batch, dim=0)
-        self._cached_pools.append(t_pool1)
-
-        C1, h1, w1 = t_pool1.shape[1], t_pool1.shape[2], t_pool1.shape[3]
-        t_norm1_in = t_pool1.reshape(B, C1, h1 * w1)
-        t_norm1 = self.norm1(t_norm1_in.reshape(C1, B, h1 * w1)).reshape(B, C1, h1, w1)
-        self._cached_inputs.append(t_norm1)
-
-        t_conv2_batch = []
-        for b in range(B):
-            tc2 = self.conv2.forward(t_norm1[b])
-            self.conv2._cached_patches = None
-            self.conv2._cached_t_post = None
-            self.conv2._cached_up = None
-            t_conv2_batch.append(tc2)
-        t_conv2 = torch.stack(t_conv2_batch, dim=0)
-
-        t_pool2_batch = []
-        for b in range(B):
-            tp2 = self._avg_pool(t_conv2[b], self.pool_size)
-            t_pool2_batch.append(tp2)
-        t_pool2 = torch.stack(t_pool2_batch, dim=0)
-        self._cached_pools.append(t_pool2)
-
-        C2, h2, w2 = t_pool2.shape[1], t_pool2.shape[2], t_pool2.shape[3]
-        t_norm2_in = t_pool2.reshape(B, C2, h2 * w2)
-        t_norm2 = self.norm2(t_norm2_in.reshape(C2, B, h2 * w2)).reshape(B, C2, h2, w2)
-
-        t_flat = t_norm2.reshape(B, -1)
-
-        t_fc_in = t_flat.T
-        t_out = self.fc.forward(t_fc_in)
-
-        self._conv1_cache = []
-        self._conv2_cache = []
-        for b in range(B):
-            self.conv1.forward(self._cached_inputs[0][b])
-            self._conv1_cache.append((self.conv1._cached_patches,
-                                      self.conv1._cached_t_post,
-                                      self.conv1._cached_up))
-            self.conv2.forward(self._cached_inputs[1][b])
-            self._conv2_cache.append((self.conv2._cached_patches,
-                                      self.conv2._cached_t_post,
-                                      self.conv2._cached_up))
-
-        return t_out
-
-    def loss_and_grads(self, t_in_raw, y, lam=5.0, T_noise=1.0):
-        """Full forward + loss + backward through ALL layers.
-
-        Returns (loss, grads_W, grads_R, stats) compatible with the existing
-        AdamTorch optimizer. Gradients are exact IFT — no surrogate approximation.
+        Returns:
+                Output spike times of shape ``(n_classes, B)``.
         """
-        t_out = self.forward(t_in_raw)
-        loss, dL_dt = latency_cross_entropy(t_out, y, self.t_max, self.fc.beta)
+        with torch.no_grad():
+            B, C, H, W = t_images.shape
+            self._fwd_cache = {}
 
-        grads_fc = self.fc.backward(dL_dt)
-        B = t_in_raw.shape[0]
-        h2 = self._cached_pools[1].shape[2]
-        w2 = self._cached_pools[1].shape[3]
+            t_encoded = torch.clamp(t_images, 0.01, 0.99)
+            t_encoded = self.t_max * (1.0 - t_encoded) + 0.1
 
-        grad_conv2_total = None
-        lam_norm2_total = None
-        for b in range(B):
-            patches, t_post, up = self._conv2_cache[b]
-            lam_fc = grads_fc[0][:, b].unsqueeze(1)
-            g, lam_prev = backward_layer_torch(
-                self.fc.W[0], self.fc._cache[0][0], self.fc.t_bias,
-                t_post[:, b].unsqueeze(1), lam_fc, up[:, b].unsqueeze(1),
-                self.tm, self.ts, False, self.fc.k_peak)
+            conv1_outs = []
+            conv1_caches = []
+            for b in range(B):
+                tc1 = self.conv1.forward(t_encoded[b])
+                conv1_outs.append(tc1)
+                conv1_caches.append((self.conv1._cached_patches.clone(),
+                                     self.conv1._cached_t_post.clone(),
+                                     self.conv1._cached_up.clone()))
+            t_conv1 = torch.stack(conv1_outs, dim=0)
+            self._fwd_cache['conv1'] = conv1_caches
 
-        grads_conv2 = [None] * 1
-        lam_prev_pool2_all = []
-        for b in range(B):
-            lam_flat = self.fc.backward(dL_dt)
-            patches, t_post_b, up_b = self._conv2_cache[b]
-            lam_post_b = torch.zeros_like(t_post_b)
-            grad2, lam_prev2 = self.conv2.backward(self._cached_inputs[1][b],
-                                                    lam_post_b)
-            if grad_conv2_total is None:
-                grad_conv2_total = grad2
-            else:
-                grad_conv2_total += grad2
+            pool1_outs = []
+            pool1_shapes = []
+            for b in range(B):
+                tp1 = self._min_pool(t_conv1[b], self.pool_size)
+                pool1_outs.append(tp1)
+                pool1_shapes.append((t_conv1[b].shape, self._pool_argmin.clone()))
+            t_pool1 = torch.stack(pool1_outs, dim=0)
+            self._fwd_cache['pool1'] = pool1_shapes
 
-        grads = list(self.fc.backward(dL_dt))
-        for b in range(B):
-            g2, lp2 = self.conv2.backward(
-                self._cached_inputs[1][b],
-                torch.zeros(self.conv2.out_channels, self._cached_pools[1].shape[2],
-                            self._cached_pools[1].shape[3],
-                            dtype=self.dtype, device=self.device))
-            if b == 0:
-                grads.insert(0, g2)
-            else:
-                grads[0] += g2
+            C1, h1, w1 = t_pool1.shape[1], t_pool1.shape[2], t_pool1.shape[3]
+            t_norm1 = t_pool1
+            self._fwd_cache['norm1_in'] = t_pool1.reshape(B, C1, h1 * w1)
 
-        grads.insert(0, torch.zeros_like(self.conv1.W))
-        grads_R = list(self.fc.R) if hasattr(self, 'fc') and self.fc.R else None
+            conv2_outs = []
+            conv2_caches = []
+            for b in range(B):
+                tc2 = self.conv2.forward(t_norm1[b])
+                conv2_outs.append(tc2)
+                conv2_caches.append((self.conv2._cached_patches.clone(),
+                                     self.conv2._cached_t_post.clone(),
+                                     self.conv2._cached_up.clone()))
+            t_conv2 = torch.stack(conv2_outs, dim=0)
+            self._fwd_cache['conv2'] = conv2_caches
 
-        all_params = [self.conv1.W, self.conv2.W] + list(self.fc.W)
-        if self.fc.R:
-            all_params += list(self.fc.R)
+            pool2_outs = []
+            pool2_shapes = []
+            for b in range(B):
+                tp2 = self._min_pool(t_conv2[b], self.pool_size)
+                pool2_outs.append(tp2)
+                pool2_shapes.append((t_conv2[b].shape, self._pool_argmin.clone()))
+            t_pool2 = torch.stack(pool2_outs, dim=0)
+            self._fwd_cache['pool2'] = pool2_shapes
 
-        return loss, grads, grads_R, {
-            "loss_timing": float(loss),
-            "t_out": t_out,
-        }
+            C2, h2, w2 = t_pool2.shape[1], t_pool2.shape[2], t_pool2.shape[3]
+            t_norm2 = t_pool2
+            self._fwd_cache['norm2_in'] = t_pool2.reshape(B, C2, h2 * w2)
+
+            t_flat = t_norm2.reshape(B, -1)
+            self._fwd_cache['t_norm2'] = t_norm2
+
+            t_fc_in = t_flat.T
+            t_out = self.fc.forward(t_fc_in)
+
+            self._fwd_cache['t_fc_in'] = t_fc_in
+            self._fwd_cache['B'] = B
+            self._fwd_cache['C1'] = C1
+            self._fwd_cache['h1'] = h1
+            self._fwd_cache['w1'] = w1
+            self._fwd_cache['C2'] = C2
+            self._fwd_cache['h2'] = h2
+            self._fwd_cache['w2'] = w2
+
+            return t_out
+
+    def loss_and_grads(self, t_images: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], list[torch.Tensor] | None, dict]:
+        """Compute loss and exact gradients over a batch.
+
+        Runs the full forward pass, applies latency cross-entropy, and
+        back-propagates through the conv + FC layers using cached values.
+
+        Args:
+            t_images: Batch of images ``(B, C, H, W)`` in ``(0, 1)``.
+            y: Ground-truth class labels of shape ``(B,)``.
+
+        Returns:
+            ``(loss, grads, grads_R, stats)`` where *grads* is a list of
+            weight-gradient tensors and *grads_R* contains optional recurrent
+            gradients (or ``None``).
+        """
+        with torch.no_grad():
+            t_out = self.forward(t_images)
+            loss, dL_dt = latency_cross_entropy(t_out, y, self.t_max, self.fc.beta)
+
+            B = self._fwd_cache['B']
+            C1 = self._fwd_cache['C1']
+            h1 = self._fwd_cache['h1']
+            w1 = self._fwd_cache['w1']
+            C2 = self._fwd_cache['C2']
+            h2 = self._fwd_cache['h2']
+            w2 = self._fwd_cache['w2']
+
+            grads_fc, lam_fc = self.fc.backward_with_input_grad(dL_dt)
+
+            grad_conv2_total = torch.zeros_like(self.conv2.W)
+            grad_conv1_total = torch.zeros_like(self.conv1.W)
+
+            for b in range(B):
+                lam_fc_b = lam_fc[:, b:b+1]
+                lam_norm2 = lam_fc_b.reshape(C2, h2 * w2)
+
+                conv2_shape, pool2_argmin = self._fwd_cache['pool2'][b]
+                saved_pool_argmin = self._pool_argmin.clone()
+                self._pool_argmin = pool2_argmin
+                lam_conv2_b = self._min_pool_backward(lam_norm2.reshape(C2, h2, w2),
+                                                       self.pool_size, C2, conv2_shape[1], conv2_shape[2])
+                self._pool_argmin = saved_pool_argmin
+
+                patches2, t_post2, up2 = self._fwd_cache['conv2'][b]
+                g2, lam_prev2 = backward_layer_torch(
+                    self.conv2.W, patches2, 0.0, t_post2,
+                    lam_conv2_b.reshape(self.conv2.out_channels, -1), up2,
+                    self.tm, self.ts, False, self.conv2.k_peak)
+                grad_conv2_total += g2
+
+                C_in2 = self.conv2.in_channels
+                kh = self.conv2.kernel_size
+                s = self.conv2.stride
+                p = self.conv2.padding
+                lam_folded = torch.zeros((C_in2, conv2_shape[1] + 2*p, conv2_shape[2] + 2*p),
+                                         dtype=self.dtype, device=self.device)
+                H_out2 = (conv2_shape[1] + 2*p - kh) // s + 1
+                W_out2 = (conv2_shape[2] + 2*p - kh) // s + 1
+                idx2 = 0
+                for i2 in range(H_out2):
+                    for j2 in range(W_out2):
+                        patch_lam = lam_prev2[:, idx2]
+                        patch_lam_no_bias = patch_lam.reshape(C_in2, kh, kh)
+                        lam_folded[:, i2*s:i2*s+kh, j2*s:j2*s+kh] += patch_lam_no_bias
+                        idx2 += 1
+                lam_pool1_b = lam_folded[:, p:p+conv2_shape[1], p:p+conv2_shape[2]]
+
+                conv1_shape, pool1_argmin = self._fwd_cache['pool1'][b]
+                saved_pool_argmin = self._pool_argmin.clone()
+                self._pool_argmin = pool1_argmin
+                lam_conv1_b = self._min_pool_backward(lam_pool1_b,
+                                                       self.pool_size, C1, conv1_shape[1], conv1_shape[2])
+                self._pool_argmin = saved_pool_argmin
+
+                patches1, t_post1, up1 = self._fwd_cache['conv1'][b]
+                g1, _ = backward_layer_torch(
+                    self.conv1.W, patches1, 0.0, t_post1,
+                    lam_conv1_b.reshape(self.conv1.out_channels, -1), up1,
+                    self.tm, self.ts, False, self.conv1.k_peak)
+                grad_conv1_total += g1
+
+            grads = [grad_conv1_total, grad_conv2_total] + grads_fc
+            grads_R = list(self.fc.R) if self.fc.R else None
+
+            return loss, grads, grads_R, {"loss_timing": float(loss), "t_out": t_out}
 
 
 class RecurrentTTFSLayer:
-    """Reurrent TTFS layer with eligibility traces.
+    """Recurrent TTFS layer with eligibility traces.
 
     Each neuron receives input from the previous layer AND from its own
     previous spike time (self-recurrence) via an eligibility trace:
@@ -372,9 +537,26 @@ class RecurrentTTFSLayer:
     This enables temporal memory without breaking the exact gradient framework.
     """
 
-    def __init__(self, n_in, n_out, tm=15.0, ts=4.0, theta=1.0, t_max=40.0,
-                 grid_pts=501, dtype=torch.float64, device=None, tau_rec=5.0,
-                 seed=0):
+    def __init__(self, n_in: int, n_out: int, tm: float = 15.0, ts: float = 4.0,
+                 theta: float = 1.0, t_max: float = 40.0, grid_pts: int = 501,
+                 dtype: torch.dtype = torch.float64,
+                 device: torch.device | None = None, tau_rec: float = 5.0,
+                 seed: int = 0) -> None:
+        """Initialise a recurrent TTFS layer.
+
+        Args:
+            n_in: Number of input neurons.
+            n_out: Number of output neurons.
+            tm: Membrane time constant.
+            ts: Synaptic time constant.
+            theta: Firing threshold.
+            t_max: Maximum spike time (response window).
+            grid_pts: Number of grid points for the lookup table.
+            dtype: Floating-point dtype.
+            device: Target device.
+            tau_rec: Decay time constant for the eligibility trace.
+            seed: Random seed for weight initialisation.
+        """
         self.n_in = n_in
         self.n_out = n_out
         self.tm = tm
@@ -398,12 +580,30 @@ class RecurrentTTFSLayer:
         self._trace = None
         self._last_spike = None
 
-    def reset_trace(self, B):
+    def reset_trace(self, B: int) -> None:
+        """Reset eligibility traces and last-spike timers for a new batch.
+
+        Args:
+            B: Batch size.
+        """
         self._trace = torch.zeros((self.n_out, B), dtype=self.dtype, device=self.device)
         self._last_spike = torch.full((self.n_out, B), float("inf"),
                                       dtype=self.dtype, device=self.device)
 
-    def forward_step(self, t_in, B):
+    def forward_step(self, t_in: torch.Tensor, B: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one recurrent forward step.
+
+        Appends the current eligibility trace as an extra input column, solves
+        the TTFS layer, then updates the trace for neurons that fired.
+
+        Args:
+            t_in: Input spike times ``(n_in, B)``.
+            B: Batch size.
+
+        Returns:
+            ``(t_post, up)`` — output spike times and du/dt at crossing,
+            each of shape ``(n_out, B)``.
+        """
         if self._trace is None:
             self.reset_trace(B)
 
@@ -436,9 +636,27 @@ class MultiSpikeNet:
     Gradients use the saltation matrix through resets for exact computation.
     """
 
-    def __init__(self, sizes, tm=15.0, ts=4.0, theta=1.0, t_max=40.0,
-                 w_scale=0.2, bias_val=0.2, seed=0, grid_pts=501,
-                 dtype=torch.float64, device=None, beta=1.0):
+    def __init__(self, sizes: list[int], tm: float = 15.0, ts: float = 4.0,
+                 theta: float = 1.0, t_max: float = 40.0, w_scale: float = 0.2,
+                 bias_val: float = 0.2, seed: int = 0, grid_pts: int = 501,
+                 dtype: torch.dtype = torch.float64,
+                 device: torch.device | None = None, beta: float = 1.0) -> None:
+        """Build a multi-spike network backed by the base TTFSNetTorch engine.
+
+        Args:
+            sizes: Layer sizes ``[n_in, ..., n_out]``.
+            tm: Membrane time constant.
+            ts: Synaptic time constant.
+            theta: Firing threshold.
+            t_max: Maximum spike time (response window).
+            w_scale: Weight standard-deviation scaling.
+            bias_val: Initial bias value.
+            seed: Random seed for weight initialisation.
+            grid_pts: Number of grid points for the lookup table.
+            dtype: Floating-point dtype.
+            device: Target device.
+            beta: Existence-channel strength scaling factor.
+        """
         self.base = TTFSNetTorch(sizes, tm=tm, ts=ts, theta=theta, t_max=t_max,
                                  w_scale=w_scale, bias_val=bias_val, seed=seed,
                                  grid_pts=grid_pts, dtype=dtype, dev=device, beta=beta)
@@ -446,10 +664,28 @@ class MultiSpikeNet:
         self.t_max = t_max
         self.beta = beta
 
-    def forward(self, t_in):
+    def forward(self, t_in: torch.Tensor) -> torch.Tensor:
+        """Forward pass using multi-spike encoding.
+
+        Args:
+            t_in: Input spike times ``(n_in, B)``.
+
+        Returns:
+            Output spike times ``(n_out, B)`` (first spike per neuron).
+        """
         return self.base.forward_multispike(t_in)
 
-    def loss_and_grads(self, t_in, y):
+    def loss_and_grads(self, t_in: torch.Tensor, y: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor], torch.Tensor]:
+        """Compute spike-count cross-entropy loss and exact gradients.
+
+        Args:
+            t_in: Input spike times ``(n_in, B)``.
+            y: Ground-truth labels ``(B,)``.
+
+        Returns:
+            ``(loss, grads, t_out)`` where *grads* is a list of weight-gradient
+            tensors and *t_out* the output spike times.
+        """
         t_out = self.forward(t_in)
         cache = getattr(self.base, '_cache_all', None)
         t_out_all = cache[-1] if cache is not None else t_out.unsqueeze(-1)
@@ -467,8 +703,19 @@ class SNNLRScheduler:
     Also adjusts existence-channel strength (lam) proportionally to LR.
     """
 
-    def __init__(self, optimizer, T_max, eta_min=0.001, warmup_epochs=5,
-                 lam_start=5.0, lam_end=50.0):
+    def __init__(self, optimizer, T_max: int, eta_min: float = 0.001,
+                 warmup_epochs: int = 5, lam_start: float = 5.0,
+                 lam_end: float = 50.0) -> None:
+        """Initialise cosine-annealing scheduler with linear warmup.
+
+        Args:
+            optimizer: Optimiser object exposing an ``lr`` attribute.
+            T_max: Total number of training epochs.
+            eta_min: Minimum learning rate at the end of annealing.
+            warmup_epochs: Number of linear-warmup epochs.
+            lam_start: Initial existence-channel strength.
+            lam_end: Final existence-channel strength.
+        """
         self.optimizer = optimizer
         self.T_max = T_max
         self.eta_min = eta_min
@@ -477,7 +724,15 @@ class SNNLRScheduler:
         self.lam_start = lam_start
         self.lam_end = lam_end
 
-    def step(self, epoch):
+    def step(self, epoch: int) -> None:
+        """Update the learning rate for the given epoch.
+
+        During warmup, the LR increases linearly from 0 to ``base_lr``.
+        After warmup, cosine annealing is applied.
+
+        Args:
+            epoch: Current epoch index (0-based).
+        """
         if epoch < self.warmup_epochs:
             factor = (epoch + 1) / self.warmup_epochs
         else:
@@ -485,128 +740,35 @@ class SNNLRScheduler:
             factor = 0.5 * (1.0 + math.cos(math.pi * progress))
         self.optimizer.lr = self.eta_min + (self.base_lr - self.eta_min) * factor
 
-    def get_lam(self, epoch):
+    def get_lam(self, epoch: int) -> float:
+        """Return the existence-channel strength for the given epoch.
+
+        Linearly ramps from ``lam_start`` to ``lam_end`` over the first 10
+        epochs, then stays at ``lam_end``.
+
+        Args:
+            epoch: Current epoch index (0-based).
+
+        Returns:
+            The ``lam`` value to use.
+        """
         factor = min(1.0, epoch / 10.0)
         return self.lam_start + (self.lam_end - self.lam_start) * factor
 
 
-def spike_time_augment(t_in, t_max=40.0, noise_std=0.1, time_shift=0.5):
+def spike_time_augment(t_in: torch.Tensor, t_max: float = 40.0,
+                       noise_std: float = 0.1, time_shift: float = 0.5) -> torch.Tensor:
+    """Augment spike times with additive noise and random time shifts.
+
+    Args:
+        t_in: Input spike times of arbitrary shape.
+        t_max: Maximum allowed spike time (clamp upper bound).
+        noise_std: Standard deviation of Gaussian noise added per spike.
+        time_shift: Maximum uniform random shift applied per sample.
+
+    Returns:
+        Augmented spike times clamped to ``[0, t_max]``.
+    """
     noise = torch.randn_like(t_in) * noise_std
     shifted = t_in + (torch.rand(1, device=t_in.device) * 2 - 1) * time_shift
     return torch.clamp(shifted + noise, 0.0, t_max)
-
-
-def train_full_cifar10(seed=0, epochs=40, lr=0.02, batch_size=128,
-                       grid_pts=1001, use_augmentation=True,
-                       use_scheduler=True, device=None):
-    """Full CIFAR-10 training with LR scheduling and augmentation.
-
-    Architecture: 144->256->128->64->10 (deeper MLP) using exact IFT gradients.
-    This is the direct comparison against the existing exp_sp05 baselines.
-    """
-    dev = device or (torch.device("cuda") if torch.cuda.is_available()
-                     else torch.device("cpu"))
-    print(f"Device: {dev}")
-
-    from cifar_io import load_cifar10, to_grayscale_resized, encode_times, subset
-    from optimizers_torch import AdamTorch
-
-    Xtr, ytr, Xte, yte = load_cifar10()
-    Xtr_sub, ytr_sub = subset(seed, Xtr, ytr, 15000)
-    gtr = to_grayscale_resized(Xtr_sub, 12)
-    gte = to_grayscale_resized(Xte, 12)
-    ttr = encode_times(gtr, 0.5, 8.0).astype(np.float64)
-    tte = encode_times(gte, 0.5, 8.0).astype(np.float64)
-
-    sizes = [144, 256, 128, 64, 10]
-    net = TTFSNetTorch(sizes, tm=15.0, ts=4.0, theta=1.0, t_max=40.0,
-                       w_scale=0.3, bias_val=0.2, seed=seed, grid_pts=grid_pts,
-                       dtype=torch.float64, dev=dev, beta=3.0)
-
-    params = net.W + net.R
-    opt = AdamTorch(params, lr=lr, clip=5.0)
-    scheduler = SNNLRScheduler(opt, T_max=epochs, warmup_epochs=5) if use_scheduler else None
-
-    B = batch_size
-    rng = np.random.default_rng(seed + 777)
-    best_test = 0.0
-
-    print(f"Training: sizes={sizes}, epochs={epochs}, lr={lr}, grid_pts={grid_pts}")
-    print(f"Augmentation: {use_augmentation}, Scheduler: {use_scheduler}")
-
-    for ep in range(epochs):
-        if scheduler:
-            scheduler.step(ep)
-            current_lam = scheduler.get_lam(ep)
-        else:
-            current_lam = 5.0
-
-        perm = rng.permutation(ttr.shape[0])
-        train_correct = 0
-        train_total = 0
-
-        for s in range(0, ttr.shape[0], B):
-            idx = perm[s:s + B]
-            t_batch = torch.tensor(ttr[idx].T, dtype=net.dtype, device=dev)
-            y_batch = torch.tensor(ytr_sub[idx], device=dev)
-
-            if use_augmentation:
-                t_batch = spike_time_augment(t_batch, t_max=40.0,
-                                             noise_std=0.05, time_shift=0.3)
-
-            _, grads, grads_R, stats = net.local_learning_grads(
-                t_batch, y_batch, T_noise=1.0, lam=current_lam, mode="deep")
-
-            gs = list(grads)
-            if grads_R is not None:
-                gs = gs + grads_R
-            gs_clean = [g if g is not None else torch.zeros_like(p)
-                        for g, p in zip(gs, params)]
-            opt.step(params, gs_clean)
-
-            with torch.no_grad():
-                t_out = net.forward(t_batch)
-                pred = torch.argmin(
-                    torch.where(torch.isfinite(t_out), t_out,
-                                torch.full_like(t_out, 1e9)), dim=0)
-                train_correct += (pred == y_batch).sum().item()
-                train_total += y_batch.shape[0]
-
-        train_acc = train_correct / train_total
-
-        test_correct = 0
-        test_total = 0
-        for s in range(0, tte.shape[0], B):
-            tb = torch.tensor(tte[s:s + B].T, dtype=net.dtype, device=dev)
-            yy = torch.tensor(yte[s:s + B], device=dev)
-            t_out = net.forward(tb)
-            pred = torch.argmin(
-                torch.where(torch.isfinite(t_out), t_out,
-                            torch.full_like(t_out, 1e9)), dim=0)
-            test_correct += (pred == yy).sum().item()
-            test_total += yy.shape[0]
-
-        test_acc = test_correct / test_total
-        best_test = max(best_test, test_acc)
-
-        if (ep + 1) % 5 == 0 or ep == 0:
-            print(f"  ep {ep+1:3d}  train={train_acc:.4f}  test={test_acc:.4f}  "
-                  f"best={best_test:.4f}  lam={current_lam:.2f}")
-
-    return best_test, train_acc, test_acc
-
-
-if __name__ == "__main__":
-    import time
-    print("=" * 60)
-    print("SNN Complete Engine: CIFAR-10 Benchmark")
-    print("=" * 60)
-
-    t0 = time.time()
-    best, tr, te = train_full_cifar10(
-        seed=0, epochs=40, lr=0.02, batch_size=128,
-        grid_pts=1001, use_augmentation=True, use_scheduler=True)
-    elapsed = time.time() - t0
-
-    print(f"\nFinal: best_test={best:.4f}, final_train={tr:.4f}, final_test={te:.4f}")
-    print(f"Wall time: {elapsed/60:.1f} min")

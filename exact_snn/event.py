@@ -35,10 +35,17 @@ from exact_snn.core import TTFSNetTorch, _du_at, _u_at
 
 N_BISECT = 20
 N_NEWTON = 8
-_TIE_TOL = 0.0  # ties handled exactly (zero-length intervals), no tolerance needed
 
 
-def _interval_coeffs(W, t_prev, t_bias, t_max, tm, ts, k_peak):
+def _interval_coeffs(
+    W: torch.Tensor,
+    t_prev: torch.Tensor,
+    t_bias: float,
+    t_max: float,
+    tm: float,
+    ts: float,
+    k_peak: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Interval decomposition of u(t).
 
     Sorted per sample (dim 0), with ties allowed: interval k spans
@@ -86,8 +93,18 @@ def _interval_coeffs(W, t_prev, t_bias, t_max, tm, ts, k_peak):
     return A_int, B_int, lo, hi
 
 
-def forward_layer_event(W, t_prev, t_bias, theta, t_max, tm, ts, k_peak,
-                        n_bisect=N_BISECT, n_newton=N_NEWTON):
+def forward_layer_event(
+    W: torch.Tensor,
+    t_prev: torch.Tensor,
+    t_bias: float,
+    theta: float,
+    t_max: float,
+    tm: float,
+    ts: float,
+    k_peak: float,
+    n_bisect: int = N_BISECT,
+    n_newton: int = N_NEWTON,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact first-crossing times, event-driven. Returns (t_post, up).
 
     t_post (n_cur, B): first t in [0, t_max] with u(t) >= theta (inf if none);
@@ -163,7 +180,16 @@ def forward_layer_event(W, t_prev, t_bias, theta, t_max, tm, ts, k_peak,
     return t_post, up
 
 
-def peak_margin_event(W, t_prev, t_bias, theta, t_max, tm, ts, k_peak):
+def peak_margin_event(
+    W: torch.Tensor,
+    t_prev: torch.Tensor,
+    t_bias: float,
+    theta: float,
+    t_max: float,
+    tm: float,
+    ts: float,
+    k_peak: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Exact extremum (t_peak, u_peak) over the response window [t_start, t_max].
 
     The maximum (or, for an all-negative response, the minimum) of a
@@ -262,8 +288,17 @@ def peak_margin_event(W, t_prev, t_bias, theta, t_max, tm, ts, k_peak):
     return t_peak, u_peak
 
 
-def edge_peak_guard_event(W, t_prev, t_bias, t_peak, u_peak, t_max,
-                          w_cut=1e-9, u_cut=1e-6, n_inferred=4001):
+def edge_peak_guard_event(
+    W: torch.Tensor,
+    t_prev: torch.Tensor,
+    t_bias: float,
+    t_peak: torch.Tensor,
+    u_peak: torch.Tensor,
+    t_max: float,
+    w_cut: float = 1e-9,
+    u_cut: float = 1e-6,
+    n_inferred: int = 4001,
+) -> torch.Tensor:
     """Grid-free degenerate-plateau guard for the event-driven engine.
 
     Same logic as edge_peak_guard but takes a step-size estimate
@@ -301,19 +336,20 @@ class EventTTFSNet(TTFSNetTorch):
     """Event-driven exact engine. Drop-in for TTFSNetTorch (same weights, same
     seeds, same interface); alpha kernels fall back to the grid engine."""
 
-    def _forward_layer(self, W, t_prev):
+    def _forward_layer(self, W: torch.Tensor, t_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._alpha:
             return super()._forward_layer(W, t_prev)
         return forward_layer_event(W, t_prev, self.t_bias, self.theta,
                                    self.t_max, self.tm, self.ts, self.k_peak)
 
-    def _peak_margin(self, W, t_prev):
+    def _peak_margin(self, W: torch.Tensor, t_prev: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self._alpha:
             return super()._peak_margin(W, t_prev)
         return peak_margin_event(W, t_prev, self.t_bias, self.theta,
                                  self.t_max, self.tm, self.ts, self.k_peak)
 
-    def _edge_peak_guard(self, W, t_prev, t_peak, u_peak):
+    def _edge_peak_guard(self, W: torch.Tensor, t_prev: torch.Tensor,
+                         t_peak: torch.Tensor, u_peak: torch.Tensor) -> torch.Tensor:
         if self._alpha:
             return super()._edge_peak_guard(W, t_prev, t_peak, u_peak)
         return edge_peak_guard_event(W, t_prev, self.t_bias, t_peak, u_peak,

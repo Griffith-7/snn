@@ -1,8 +1,10 @@
 """Latency cross-entropy loss on torch tensors (SP-01)."""
+from __future__ import annotations
+
 import torch
 
 
-def latency_cross_entropy(t_out, y, t_max, beta=1.0):
+def latency_cross_entropy(t_out: torch.Tensor, y: torch.Tensor, t_max: float, beta: float = 1.0) -> tuple[float, torch.Tensor]:
     """p_k = softmax(-beta * t_out_k); L = -ln p_y (averaged over batch).
 
     Silent outputs (t_out = inf) are placed at a large finite time for the
@@ -23,7 +25,7 @@ def latency_cross_entropy(t_out, y, t_max, beta=1.0):
     return float(loss.item()), dL
 
 
-def spike_count_cross_entropy(t_spikes, y, beta=1.0):
+def spike_count_cross_entropy(t_spikes: torch.Tensor, y: torch.Tensor, beta: float = 1.0) -> tuple[float, torch.Tensor]:
     """Cross-entropy on spike counts. t_spikes: (n_out, B, K) or (n_out, B).
 
     Counts finite spike times per output neuron, then applies CE on the counts.
@@ -34,11 +36,6 @@ def spike_count_cross_entropy(t_spikes, y, beta=1.0):
         counts = torch.isfinite(t_spikes).float().sum(dim=2)
     else:
         counts = (torch.isfinite(t_spikes)).float()
-    counts = counts - counts.mean(dim=0, keepdim=True)
-    logits = beta * counts
-    logits = logits - logits.max(dim=0, keepdim=True).values
-    p = torch.exp(logits)
-    p = p / p.sum(dim=0, keepdim=True)
     B = t_spikes.shape[1]
     counts = torch.isfinite(t_spikes).float().sum(dim=2) if t_spikes.dim() == 3 else torch.isfinite(t_spikes).float()
     counts = counts - counts.mean(dim=0, keepdim=True)
@@ -53,7 +50,7 @@ def spike_count_cross_entropy(t_spikes, y, beta=1.0):
     return float(loss.item()), dL
 
 
-def rate_latency_loss(t_spikes, y, t_max, beta=1.0):
+def rate_latency_loss(t_spikes: torch.Tensor, y: torch.Tensor, t_max: float, beta: float = 1.0) -> tuple[float, torch.Tensor]:
     """Combined rate-latency loss: CE on spike counts + latency CE on first spike.
 
     Combines spike_count_cross_entropy (rate) with latency_cross_entropy (TTFS).
