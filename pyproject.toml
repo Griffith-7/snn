@@ -42,3 +42,7 @@ Repository = "https://github.com/Griffith-7/snn"
 
 [tool.setuptools.packages.find]
 include = ["exact_snn*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
